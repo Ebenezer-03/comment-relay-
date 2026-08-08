@@ -7,6 +7,9 @@ Comment Relay is a creator-controlled reply desk for one YouTube video. It group
 ```bash
 npm install
 npm run dev
+npm run server
 ```
 
-The current slice is a frontend-first demo using seeded comments. The integration seams are deliberately small: replace the seeded clusters with `commentThreads.list`, pass creator context to a bounded triage/drafting service, and connect the explicit send action to `comments.insert`.
+The frontend runs at `http://localhost:5173` and the API runs at `http://localhost:8787`.
+
+The frontend still falls back to seeded comments when the API is not configured. To enable live YouTube data, copy `.env.example` to `.env`, create a Google OAuth web client, add `http://localhost:8787/api/oauth2callback` as an authorized redirect URI, and fill in the client credentials. The backend uses `commentThreads.list` for sync and `comments.insert` only for explicitly selected replies.

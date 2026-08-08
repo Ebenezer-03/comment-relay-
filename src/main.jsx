@@ -1,7 +1,9 @@
-import { StrictMode, useMemo, useState } from 'react'
+import { StrictMode, useEffect, useMemo, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { Check, ChevronDown, CircleHelp, ExternalLink, Inbox, Link2, MessageCircle, MoreHorizontal, Play, RefreshCw, Send, Sparkles, Video } from 'lucide-react'
 import './styles.css'
+
+const apiBase = import.meta.env.VITE_API_BASE || 'http://localhost:8787'
 
 const initialClusters = [
   {
@@ -38,8 +40,21 @@ function App() {
   const [activeId, setActiveId] = useState('install')
   const [selected, setSelected] = useState([1, 2])
   const [context, setContext] = useState('Node 18+ is required. The current install command is npm install @modelcontextprotocol/sdk. Keep replies practical and warm.')
+  const [videoUrl, setVideoUrl] = useState('')
   const [synced, setSynced] = useState('2 min ago')
   const [sent, setSent] = useState(false)
+  const [liveSession, setLiveSession] = useState(() => sessionStorage.getItem('comment-relay-session') || '')
+  const [syncing, setSyncing] = useState(false)
+  const [sendError, setSendError] = useState('')
+
+  useEffect(() => {
+    const session = new URLSearchParams(window.location.search).get('session')
+    if (session) {
+      sessionStorage.setItem('comment-relay-session', session)
+      setLiveSession(session)
+      window.history.replaceState({}, '', window.location.pathname)
+    }
+  }, [])
 
   const active = clusters.find((cluster) => cluster.id === activeId)
   const selectedCount = active.comments.filter((comment) => selected.includes(comment.id)).length
@@ -56,13 +71,46 @@ function App() {
     setClusters((current) => current.map((cluster) => cluster.id === activeId ? { ...cluster, draft: value } : cluster))
   }
 
-  function syncComments() {
-    setSynced('just now')
+  async function syncComments() {
+    setSyncing(true)
+    setSendError('')
+    if (liveSession) {
+      try {
+        if (!videoUrl.trim()) throw new Error('Paste a YouTube video URL or ID before syncing.')
+        const response = await fetch(`${apiBase}/api/comments?videoId=${encodeURIComponent(videoUrl.trim())}`, { headers: { 'X-Relay-Session': liveSession } })
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || 'Sync failed')
+        if (data.clusters?.length) {
+          setClusters(data.clusters)
+          setActiveId(data.clusters[0].id)
+          setSelected([])
+        }
+        setSynced('just now')
+      } catch (error) {
+        setSendError(error.message)
+      }
+    } else {
+      setSynced('demo data')
+    }
     setSent(false)
+    setSyncing(false)
   }
 
-  function sendReplies() {
+  async function sendReplies() {
     if (!selectedCount) return
+    setSendError('')
+    if (liveSession) {
+      try {
+        const response = await fetch(`${apiBase}/api/replies`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Relay-Session': liveSession }, body: JSON.stringify({ parentIds: selectedComments.map((comment) => comment.parentId || comment.id), text: active.draft }) })
+        const data = await response.json()
+        if (!response.ok) throw new Error(data.error || 'Reply failed')
+        const failures = data.results?.filter((result) => !result.ok) || []
+        if (failures.length) throw new Error(`${failures.length} selected repl${failures.length === 1 ? 'y' : 'ies'} failed to send.`)
+      } catch (error) {
+        setSendError(error.message)
+        return
+      }
+    }
     setSent(true)
   }
 
@@ -77,16 +125,16 @@ function App() {
     </aside>
 
     <main className="main-content">
-      <header className="topbar"><div><div className="eyebrow">REPLY DESK / ONE VIDEO</div><h1>Answer the questions<br /><em>that keep coming up.</em></h1></div><div className="top-actions"><button className="secondary-button" onClick={syncComments}><RefreshCw size={15} />Sync comments <span className="sync-time">{synced}</span></button><button className="avatar avatar-purple">AK</button></div></header>
+      <header className="topbar"><div><div className="eyebrow">REPLY DESK / ONE VIDEO</div><h1>Answer the questions<br /><em>that keep coming up.</em></h1></div><div className="top-actions">{liveSession ? <span className="connected-badge"><span className="live-dot" /> Google connected</span> : <a className="connect-button" href={`${apiBase}/api/auth/google`}>Connect Google</a>}<button className="secondary-button" onClick={syncComments} disabled={syncing}><RefreshCw size={15} className={syncing ? 'spin' : ''} />Sync comments <span className="sync-time">{synced}</span></button><button className="avatar avatar-purple">AK</button></div></header>
 
-      <section className="video-bar"><div className="video-identity"><div className="video-square"><Video size={20} /></div><div><strong>Build your first MCP server with Node.js</strong><small><span className="live-dot" /> youtube.com/watch?v=mcp-101 <ExternalLink size={12} /></small></div></div><div className="video-stats"><span><strong>{totalQuestions}</strong> questions grouped</span><span><strong>2</strong> answer packs ready</span></div></section>
+      <section className="video-bar"><div className="video-identity"><div className="video-square"><Video size={20} /></div><div><strong>Build your first MCP server with Node.js</strong><small><span className="live-dot" /> Paste the video URL or ID to sync live comments <ExternalLink size={12} /></small></div></div><div className="video-controls"><input aria-label="YouTube video URL or ID" value={videoUrl} onChange={(event) => setVideoUrl(event.target.value)} placeholder="YouTube URL or video ID" /><div className="video-stats"><span><strong>{totalQuestions}</strong> questions grouped</span><span><strong>2</strong> answer packs ready</span></div></div></section>
 
       <div className="workbench">
         <section className="cluster-rail"><div className="section-heading"><span>ANSWER PACKS</span><span className="muted">{clusters.length}</span></div><div className="pack-intro">Repeated questions, grouped so you can answer once.</div>{clusters.map((cluster) => <button className={`cluster-item ${activeId === cluster.id ? 'cluster-active' : ''}`} key={cluster.id} onClick={() => { setActiveId(cluster.id); setSelected([]); setSent(false) }}><div className="cluster-top"><span className={`priority-dot ${cluster.tone}`} /><strong>{cluster.label}</strong><span className="cluster-count">{cluster.count}</span></div><p>{cluster.summary}</p><div className="cluster-bottom"><span className={`priority ${cluster.tone}`}>{cluster.priority} priority</span><span>{activeId === cluster.id ? 'OPEN' : 'VIEW'}</span></div></button>)}</section>
 
         <section className="thread-panel"><div className="panel-head"><div><div className="eyebrow">PACK / {active.priority.toUpperCase()} PRIORITY</div><h2>{active.label}</h2></div><span className={`pill ${active.tone}`}>{active.count} similar comments</span></div><div className="rationale"><Sparkles size={15} /><span><strong>Why these are together</strong>{active.summary} The wording and intent match closely enough for one tailored answer.</span></div><div className="thread-list">{active.comments.map((comment) => <article className={`comment ${selected.includes(comment.id) ? 'comment-selected' : ''}`} key={comment.id}><button className={`checkbox ${selected.includes(comment.id) ? 'checked' : ''}`} onClick={() => toggleComment(comment.id)} aria-label={`Select ${comment.name}`}>{selected.includes(comment.id) && <Check size={13} />}</button><div className={`avatar avatar-${comment.id % 3 === 0 ? 'blue' : comment.id % 2 ? 'orange' : 'pink'}`}>{comment.initials}</div><div className="comment-body"><div className="comment-meta"><strong>{comment.name}</strong><span>{comment.time}</span><span className="comment-video">on this video</span></div><p>{comment.text}</p><div className="comment-actions"><span>♡ {comment.likes}</span><button>Open on YouTube <ExternalLink size={11} /></button></div></div></article>)}</div></section>
 
-        <section className="composer-panel"><div className="panel-head composer-head"><div><div className="eyebrow">YOUR REPLY</div><h2>Draft once, send with care.</h2></div><span className="draft-badge"><Sparkles size={13} /> AI DRAFT</span></div><label className="field-label">Replying to <span>{selectedCount} selected {selectedCount === 1 ? 'comment' : 'comments'}</span></label><textarea value={active.draft} onChange={(event) => changeDraft(event.target.value)} /><div className="context-section"><div className="field-label">CONTEXT USED <button className="tiny-button">Edit context <Link2 size={12} /></button></div><div className="context-chips"><span>Known fix</span><span>Creator voice</span><span>Video details</span></div><textarea className="context-input" value={context} onChange={(event) => setContext(event.target.value)} /></div><div className="composer-footer"><span className="character-count">{active.draft.length} / 800</span><button className="send-button" disabled={!selectedCount || sent} onClick={sendReplies}>{sent ? <><Check size={16} />Replies sent</> : <><Send size={16} />Reply selected <span>{selectedCount}</span></>}</button></div>{sent && <div className="success-note"><Check size={15} /> {selectedCount} reply results recorded. Nothing else was sent.</div>}<div className="consent-note">You always choose what gets sent. Comment Relay never auto-replies.</div></section>
+        <section className="composer-panel"><div className="panel-head composer-head"><div><div className="eyebrow">YOUR REPLY</div><h2>Draft once, send with care.</h2></div><span className="draft-badge"><Sparkles size={13} /> AI DRAFT</span></div><label className="field-label">Replying to <span>{selectedCount} selected {selectedCount === 1 ? 'comment' : 'comments'}</span></label><textarea value={active.draft} onChange={(event) => changeDraft(event.target.value)} /><div className="context-section"><div className="field-label">CONTEXT USED <button className="tiny-button">Edit context <Link2 size={12} /></button></div><div className="context-chips"><span>Known fix</span><span>Creator voice</span><span>Video details</span></div><textarea className="context-input" value={context} onChange={(event) => setContext(event.target.value)} /></div><div className="composer-footer"><span className="character-count">{active.draft.length} / 800</span><button className="send-button" disabled={!selectedCount || sent} onClick={sendReplies}>{sent ? <><Check size={16} />Replies sent</> : <><Send size={16} />Reply selected <span>{selectedCount}</span></>}</button></div>{sent && <div className="success-note"><Check size={15} /> {selectedCount} reply results recorded. Nothing else was sent.</div>}{sendError && <div className="error-note">{sendError}</div>}<div className="consent-note">You always choose what gets sent. Comment Relay never auto-replies.</div></section>
       </div>
     </main>
   </div>

@@ -6,6 +6,8 @@ dist/
 .env.*
 !.env.example
 
+data/
+
 .DS_Store
 *.log
 .idea/
