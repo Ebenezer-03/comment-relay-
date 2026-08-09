@@ -116,11 +116,15 @@ function App() {
 
   return <div className="app-shell">
     <aside className="sidebar">
-      <div className="brand"><span className="brand-mark"><MessageCircle size={17} fill="currentColor" /></span><span>comment relay</span></div>
-      <div className="workspace-switcher"><span className="avatar avatar-purple">AK</span><span><strong>Alex Kim</strong><small>Creator workspace</small></span><ChevronDown size={15} /></div>
-      <nav className="main-nav"><a className="nav-active"><Inbox size={17} />Reply desk<span className="nav-count">13</span></a><a><Video size={17} />Connected videos</a><a><Check size={17} />Sent replies</a></nav>
-      <div className="side-label">WORKSPACE</div>
-      <div className="video-mini"><div className="video-thumb"><Play size={15} fill="white" /><span>12:48</span></div><div><strong>Build an MCP server...</strong><small>1 video connected</small></div><MoreHorizontal size={16} /></div>
+      <div className="sidebar-fixed-top">
+        <div className="brand"><span className="brand-mark"><MessageCircle size={17} fill="currentColor" /></span><span>comment relay</span></div>
+        <div className="workspace-switcher"><span className="avatar avatar-purple">AK</span><span><strong>Alex Kim</strong><small>Creator workspace</small></span><ChevronDown size={15} /></div>
+        <nav className="main-nav"><a className="nav-active"><Inbox size={17} />Reply desk<span className="nav-count">13</span></a><a><Video size={17} />Connected videos</a><a><Check size={17} />Sent replies</a></nav>
+      </div>
+      <div className="sidebar-scroll">
+        <div className="side-label">WORKSPACE</div>
+        <div className="video-mini"><div className="video-thumb"><Play size={15} fill="white" /><span>12:48</span></div><div><strong>Build an MCP server...</strong><small>1 video connected</small></div><MoreHorizontal size={16} /></div>
+      </div>
       <div className="sidebar-bottom"><div className="context-note"><Sparkles size={15} /><span><strong>Context makes replies better</strong><small>Add your FAQ, known fixes, and voice here.</small></span></div><button className="link-button"><CircleHelp size={15} />Help & guidelines</button></div>
     </aside>
 
