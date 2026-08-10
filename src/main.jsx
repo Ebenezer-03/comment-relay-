@@ -1,11 +1,15 @@
 import { StrictMode, useEffect, useMemo, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { Check, ChevronDown, CircleHelp, ExternalLink, Inbox, Link2, MessageCircle, MoreHorizontal, Play, RefreshCw, Send, Sparkles, Video } from 'lucide-react'
+import { ArrowLeft, Check, ChevronDown, CircleHelp, ExternalLink, Inbox, Link2, MessageCircle, MoreHorizontal, Play, RefreshCw, Send, Sparkles, Video } from 'lucide-react'
 import './styles.css'
 
 const apiBase = import.meta.env.VITE_API_BASE || 'http://localhost:8787'
 
-const initialClusters = [
+const PACK_LABELS = { install: 'Install error', env: 'Environment setup', praise: 'Positive feedback', other: 'Needs review' }
+
+// Shown when no Google account is connected, so the app is still explorable
+// without live data.
+const demoClusters = [
   {
     id: 'install', label: 'Install error', count: 4, priority: 'High', tone: 'coral', summary: 'Viewers are blocked installing the MCP SDK.',
     draft: 'Hey! The package name has changed slightly since I recorded this. Run `npm install @modelcontextprotocol/sdk` and make sure you’re on Node 18 or newer. That should get you unstuck — let me know how it goes.',
@@ -35,16 +39,34 @@ const initialClusters = [
   },
 ]
 
+function formatRelative(iso) {
+  if (!iso) return 'never synced'
+  const minutes = Math.round((Date.now() - new Date(iso).getTime()) / 60000)
+  if (minutes < 1) return 'just now'
+  if (minutes < 60) return `${minutes} min ago`
+  const hours = Math.round(minutes / 60)
+  if (hours < 24) return `${hours} hr ago`
+  return `${Math.round(hours / 24)} d ago`
+}
+
 function App() {
-  const [clusters, setClusters] = useState(initialClusters)
+  const [liveSession, setLiveSession] = useState(() => sessionStorage.getItem('comment-relay-session') || '')
+
+  // Workspace: the ranked list of a connected creator's videos.
+  const [workspaceVideos, setWorkspaceVideos] = useState([])
+  const [workspaceLoading, setWorkspaceLoading] = useState(false)
+  const [workspaceSyncing, setWorkspaceSyncing] = useState(false)
+  const [workspaceError, setWorkspaceError] = useState('')
+
+  // Reply desk: null activeVideo means "show the workspace list" when live,
+  // or the built-in demo video when no Google account is connected.
+  const [activeVideo, setActiveVideo] = useState(null)
+  const [videoLoading, setVideoLoading] = useState(false)
+  const [clusters, setClusters] = useState(demoClusters)
   const [activeId, setActiveId] = useState('install')
   const [selected, setSelected] = useState([1, 2])
   const [context, setContext] = useState('Node 18+ is required. The current install command is npm install @modelcontextprotocol/sdk. Keep replies practical and warm.')
-  const [videoUrl, setVideoUrl] = useState('')
-  const [synced, setSynced] = useState('2 min ago')
   const [sent, setSent] = useState(false)
-  const [liveSession, setLiveSession] = useState(() => sessionStorage.getItem('comment-relay-session') || '')
-  const [syncing, setSyncing] = useState(false)
   const [sendError, setSendError] = useState('')
 
   useEffect(() => {
@@ -56,11 +78,66 @@ function App() {
     }
   }, [])
 
+  async function loadWorkspaceVideos() {
+    setWorkspaceLoading(true)
+    setWorkspaceError('')
+    try {
+      const response = await fetch(`${apiBase}/api/videos`, { headers: { 'X-Relay-Session': liveSession } })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error || 'Could not load videos.')
+      setWorkspaceVideos(data.videos || [])
+    } catch (error) {
+      setWorkspaceError(error.message)
+    }
+    setWorkspaceLoading(false)
+  }
+
+  useEffect(() => {
+    if (liveSession) loadWorkspaceVideos()
+  }, [liveSession])
+
+  async function syncWorkspaceVideos() {
+    setWorkspaceSyncing(true)
+    setWorkspaceError('')
+    try {
+      const response = await fetch(`${apiBase}/api/videos/sync`, { method: 'POST', headers: { 'X-Relay-Session': liveSession } })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error || 'Sync failed.')
+      setWorkspaceVideos(data.videos || [])
+    } catch (error) {
+      setWorkspaceError(error.message)
+    }
+    setWorkspaceSyncing(false)
+  }
+
+  async function openVideo(videoId) {
+    setVideoLoading(true)
+    setWorkspaceError('')
+    try {
+      const response = await fetch(`${apiBase}/api/videos/${videoId}`, { headers: { 'X-Relay-Session': liveSession } })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error || 'Could not open this video.')
+      setActiveVideo(data.video)
+      setClusters(data.clusters)
+      setActiveId(data.clusters[0]?.id || '')
+      setSelected([])
+      setSent(false)
+      setSendError('')
+    } catch (error) {
+      setWorkspaceError(error.message)
+    }
+    setVideoLoading(false)
+  }
+
+  function backToWorkspace() {
+    setActiveVideo(null)
+  }
+
   const active = clusters.find((cluster) => cluster.id === activeId)
-  const selectedCount = active.comments.filter((comment) => selected.includes(comment.id)).length
+  const selectedCount = active ? active.comments.filter((comment) => selected.includes(comment.id)).length : 0
   const totalQuestions = clusters.reduce((sum, cluster) => sum + (cluster.id === 'praise' ? 0 : cluster.count), 0)
 
-  const selectedComments = useMemo(() => active.comments.filter((comment) => selected.includes(comment.id)), [active, selected])
+  const selectedComments = useMemo(() => active ? active.comments.filter((comment) => selected.includes(comment.id)) : [], [active, selected])
 
   function toggleComment(id) {
     setSelected((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])
@@ -71,35 +148,23 @@ function App() {
     setClusters((current) => current.map((cluster) => cluster.id === activeId ? { ...cluster, draft: value } : cluster))
   }
 
-  async function syncComments() {
-    setSyncing(true)
-    setSendError('')
-    if (liveSession) {
-      try {
-        if (!videoUrl.trim()) throw new Error('Paste a YouTube video URL or ID before syncing.')
-        const response = await fetch(`${apiBase}/api/comments?videoId=${encodeURIComponent(videoUrl.trim())}`, { headers: { 'X-Relay-Session': liveSession } })
-        const data = await response.json()
-        if (!response.ok) throw new Error(data.error || 'Sync failed')
-        if (data.clusters?.length) {
-          setClusters(data.clusters)
-          setActiveId(data.clusters[0].id)
-          setSelected([])
-        }
-        setSynced('just now')
-      } catch (error) {
-        setSendError(error.message)
-      }
-    } else {
-      setSynced('demo data')
+  async function saveDraft() {
+    if (!liveSession || !activeVideo) return
+    try {
+      await fetch(`${apiBase}/api/videos/${activeVideo.id}/packs/${activeId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'X-Relay-Session': liveSession },
+        body: JSON.stringify({ draft: active.draft }),
+      })
+    } catch {
+      // Non-fatal: the draft still lives in local state even if the save fails.
     }
-    setSent(false)
-    setSyncing(false)
   }
 
   async function sendReplies() {
     if (!selectedCount) return
     setSendError('')
-    if (liveSession) {
+    if (liveSession && activeVideo) {
       try {
         const response = await fetch(`${apiBase}/api/replies`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Relay-Session': liveSession }, body: JSON.stringify({ parentIds: selectedComments.map((comment) => comment.parentId || comment.id), text: active.draft }) })
         const data = await response.json()
@@ -114,34 +179,109 @@ function App() {
     setSent(true)
   }
 
+  const inWorkspaceList = liveSession && !activeVideo
+
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="sidebar-fixed-top">
         <div className="brand"><span className="brand-mark"><MessageCircle size={17} fill="currentColor" /></span><span>comment relay</span></div>
         <div className="workspace-switcher"><span className="avatar avatar-purple">AK</span><span><strong>Alex Kim</strong><small>Creator workspace</small></span><ChevronDown size={15} /></div>
-        <nav className="main-nav"><a className="nav-active"><Inbox size={17} />Reply desk<span className="nav-count">13</span></a><a><Video size={17} />Connected videos</a><a><Check size={17} />Sent replies</a></nav>
+        <nav className="main-nav">
+          <a className={!inWorkspaceList ? 'nav-active' : ''} onClick={backToWorkspace}><Inbox size={17} />Reply desk<span className="nav-count">{totalQuestions}</span></a>
+          <a className={inWorkspaceList ? 'nav-active' : ''} onClick={backToWorkspace}><Video size={17} />Connected videos{liveSession && <span className="nav-count">{workspaceVideos.length}</span>}</a>
+          <a><Check size={17} />Sent replies</a>
+        </nav>
       </div>
       <div className="sidebar-scroll">
         <div className="side-label">WORKSPACE</div>
-        <div className="video-mini"><div className="video-thumb"><Play size={15} fill="white" /><span>12:48</span></div><div><strong>Build an MCP server...</strong><small>1 video connected</small></div><MoreHorizontal size={16} /></div>
+        {activeVideo
+          ? <div className="video-mini"><div className="video-thumb">{activeVideo.thumbnailUrl ? <img src={activeVideo.thumbnailUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : <Play size={15} fill="white" />}</div><div><strong>{activeVideo.title}</strong><small>Synced {formatRelative(activeVideo.lastSyncedAt)}</small></div><MoreHorizontal size={16} /></div>
+          : <div className="video-mini"><div className="video-thumb"><Play size={15} fill="white" /></div><div><strong>{liveSession ? `${workspaceVideos.length} video${workspaceVideos.length === 1 ? '' : 's'} connected` : 'Build an MCP server...'}</strong><small>{liveSession ? 'Pick one to reply' : '1 video connected'}</small></div><MoreHorizontal size={16} /></div>}
       </div>
       <div className="sidebar-bottom"><div className="context-note"><Sparkles size={15} /><span><strong>Context makes replies better</strong><small>Add your FAQ, known fixes, and voice here.</small></span></div><button className="link-button"><CircleHelp size={15} />Help & guidelines</button></div>
     </aside>
 
     <main className="main-content">
-      <header className="topbar"><div><div className="eyebrow">REPLY DESK / ONE VIDEO</div><h1>Answer the questions<br /><em>that keep coming up.</em></h1></div><div className="top-actions">{liveSession ? <span className="connected-badge"><span className="live-dot" /> Google connected</span> : <a className="connect-button" href={`${apiBase}/api/auth/google`}>Connect Google</a>}<button className="secondary-button" onClick={syncComments} disabled={syncing}><RefreshCw size={15} className={syncing ? 'spin' : ''} />Sync comments <span className="sync-time">{synced}</span></button><button className="avatar avatar-purple">AK</button></div></header>
+      {inWorkspaceList ? (
+        <WorkspaceList
+          videos={workspaceVideos}
+          loading={workspaceLoading}
+          syncing={workspaceSyncing}
+          error={workspaceError}
+          onSync={syncWorkspaceVideos}
+          onOpen={openVideo}
+          opening={videoLoading}
+        />
+      ) : (
+        <>
+          <header className="topbar">
+            <div>
+              {liveSession && <button className="secondary-button" style={{ marginBottom: 14 }} onClick={backToWorkspace}><ArrowLeft size={14} />Back to videos</button>}
+              <div className="eyebrow">REPLY DESK{liveSession ? '' : ' / DEMO VIDEO'}</div>
+              <h1>Answer the questions<br /><em>that keep coming up.</em></h1>
+            </div>
+            <div className="top-actions">
+              {liveSession ? <span className="connected-badge"><span className="live-dot" /> Google connected</span> : <a className="connect-button" href={`${apiBase}/api/auth/google`}>Connect Google</a>}
+              <button className="avatar avatar-purple">AK</button>
+            </div>
+          </header>
 
-      <section className="video-bar"><div className="video-identity"><div className="video-square"><Video size={20} /></div><div><strong>Build your first MCP server with Node.js</strong><small><span className="live-dot" /> Paste the video URL or ID to sync live comments <ExternalLink size={12} /></small></div></div><div className="video-controls"><input aria-label="YouTube video URL or ID" value={videoUrl} onChange={(event) => setVideoUrl(event.target.value)} placeholder="YouTube URL or video ID" /><div className="video-stats"><span><strong>{totalQuestions}</strong> questions grouped</span><span><strong>2</strong> answer packs ready</span></div></div></section>
+          <section className="video-bar">
+            <div className="video-identity">
+              <div className="video-square">{activeVideo?.thumbnailUrl ? <img src={activeVideo.thumbnailUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: 4 }} /> : <Video size={20} />}</div>
+              <div><strong>{activeVideo?.title || 'Build your first MCP server with Node.js'}</strong><small><span className="live-dot" /> {activeVideo ? `Synced ${formatRelative(activeVideo.lastSyncedAt)}` : 'Demo data — connect Google to see your real videos'} <ExternalLink size={12} /></small></div>
+            </div>
+            <div className="video-controls">
+              <div className="video-stats"><span><strong>{totalQuestions}</strong> questions grouped</span><span><strong>{clusters.length}</strong> answer packs ready</span></div>
+            </div>
+          </section>
 
-      <div className="workbench">
-        <section className="cluster-rail"><div className="section-heading"><span>ANSWER PACKS</span><span className="muted">{clusters.length}</span></div><div className="pack-intro">Repeated questions, grouped so you can answer once.</div>{clusters.map((cluster) => <button className={`cluster-item ${activeId === cluster.id ? 'cluster-active' : ''}`} key={cluster.id} onClick={() => { setActiveId(cluster.id); setSelected([]); setSent(false) }}><div className="cluster-top"><span className={`priority-dot ${cluster.tone}`} /><strong>{cluster.label}</strong><span className="cluster-count">{cluster.count}</span></div><p>{cluster.summary}</p><div className="cluster-bottom"><span className={`priority ${cluster.tone}`}>{cluster.priority} priority</span><span>{activeId === cluster.id ? 'OPEN' : 'VIEW'}</span></div></button>)}</section>
+          {videoLoading ? <p className="pack-intro">Loading…</p> : !active ? (
+            <div className="rationale" style={{ maxWidth: 480 }}><Sparkles size={15} /><span><strong>No comments to group yet</strong>This video hasn't picked up any comments matching the answer-pack categories. Try again after it gets more engagement.</span></div>
+          ) : (
+            <div className="workbench">
+              <section className="cluster-rail"><div className="section-heading"><span>ANSWER PACKS</span><span className="muted">{clusters.length}</span></div><div className="pack-intro">Repeated questions, grouped so you can answer once.</div>{clusters.map((cluster) => <button className={`cluster-item ${activeId === cluster.id ? 'cluster-active' : ''}`} key={cluster.id} onClick={() => { setActiveId(cluster.id); setSelected([]); setSent(false) }}><div className="cluster-top"><span className={`priority-dot ${cluster.tone}`} /><strong>{cluster.label}</strong><span className="cluster-count">{cluster.count}</span></div><p>{cluster.summary}</p><div className="cluster-bottom"><span className={`priority ${cluster.tone}`}>{cluster.priority} priority</span><span>{activeId === cluster.id ? 'OPEN' : 'VIEW'}</span></div></button>)}</section>
 
-        <section className="thread-panel"><div className="panel-head"><div><div className="eyebrow">PACK / {active.priority.toUpperCase()} PRIORITY</div><h2>{active.label}</h2></div><span className={`pill ${active.tone}`}>{active.count} similar comments</span></div><div className="rationale"><Sparkles size={15} /><span><strong>Why these are together</strong>{active.summary} The wording and intent match closely enough for one tailored answer.</span></div><div className="thread-list">{active.comments.map((comment) => <article className={`comment ${selected.includes(comment.id) ? 'comment-selected' : ''}`} key={comment.id}><button className={`checkbox ${selected.includes(comment.id) ? 'checked' : ''}`} onClick={() => toggleComment(comment.id)} aria-label={`Select ${comment.name}`}>{selected.includes(comment.id) && <Check size={13} />}</button><div className={`avatar avatar-${comment.id % 3 === 0 ? 'blue' : comment.id % 2 ? 'orange' : 'pink'}`}>{comment.initials}</div><div className="comment-body"><div className="comment-meta"><strong>{comment.name}</strong><span>{comment.time}</span><span className="comment-video">on this video</span></div><p>{comment.text}</p><div className="comment-actions"><span>♡ {comment.likes}</span><button>Open on YouTube <ExternalLink size={11} /></button></div></div></article>)}</div></section>
+              <section className="thread-panel"><div className="panel-head"><div><div className="eyebrow">PACK / {active.priority.toUpperCase()} PRIORITY</div><h2>{active.label}</h2></div><span className={`pill ${active.tone}`}>{active.count} similar comments</span></div><div className="rationale"><Sparkles size={15} /><span><strong>Why these are together</strong>{active.summary} The wording and intent match closely enough for one tailored answer.</span></div><div className="thread-list">{active.comments.map((comment) => <article className={`comment ${selected.includes(comment.id) ? 'comment-selected' : ''}`} key={comment.id}><button className={`checkbox ${selected.includes(comment.id) ? 'checked' : ''}`} onClick={() => toggleComment(comment.id)} aria-label={`Select ${comment.name}`}>{selected.includes(comment.id) && <Check size={13} />}</button><div className={`avatar avatar-${comment.id % 3 === 0 ? 'blue' : comment.id % 2 ? 'orange' : 'pink'}`}>{comment.initials}</div><div className="comment-body"><div className="comment-meta"><strong>{comment.name}</strong><span>{comment.time}</span><span className="comment-video">on this video</span></div><p>{comment.text}</p><div className="comment-actions"><span>♡ {comment.likes}</span><button>Open on YouTube <ExternalLink size={11} /></button></div></div></article>)}</div></section>
 
-        <section className="composer-panel"><div className="panel-head composer-head"><div><div className="eyebrow">YOUR REPLY</div><h2>Draft once, send with care.</h2></div><span className="draft-badge"><Sparkles size={13} /> AI DRAFT</span></div><label className="field-label">Replying to <span>{selectedCount} selected {selectedCount === 1 ? 'comment' : 'comments'}</span></label><textarea value={active.draft} onChange={(event) => changeDraft(event.target.value)} /><div className="context-section"><div className="field-label">CONTEXT USED <button className="tiny-button">Edit context <Link2 size={12} /></button></div><div className="context-chips"><span>Known fix</span><span>Creator voice</span><span>Video details</span></div><textarea className="context-input" value={context} onChange={(event) => setContext(event.target.value)} /></div><div className="composer-footer"><span className="character-count">{active.draft.length} / 800</span><button className="send-button" disabled={!selectedCount || sent} onClick={sendReplies}>{sent ? <><Check size={16} />Replies sent</> : <><Send size={16} />Reply selected <span>{selectedCount}</span></>}</button></div>{sent && <div className="success-note"><Check size={15} /> {selectedCount} reply results recorded. Nothing else was sent.</div>}{sendError && <div className="error-note">{sendError}</div>}<div className="consent-note">You always choose what gets sent. Comment Relay never auto-replies.</div></section>
-      </div>
+              <section className="composer-panel"><div className="panel-head composer-head"><div><div className="eyebrow">YOUR REPLY</div><h2>Draft once, send with care.</h2></div><span className="draft-badge"><Sparkles size={13} /> AI DRAFT</span></div><label className="field-label">Replying to <span>{selectedCount} selected {selectedCount === 1 ? 'comment' : 'comments'}</span></label><textarea value={active.draft} onChange={(event) => changeDraft(event.target.value)} onBlur={saveDraft} /><div className="context-section"><div className="field-label">CONTEXT USED <button className="tiny-button">Edit context <Link2 size={12} /></button></div><div className="context-chips"><span>Known fix</span><span>Creator voice</span><span>Video details</span></div><textarea className="context-input" value={context} onChange={(event) => setContext(event.target.value)} /></div><div className="composer-footer"><span className="character-count">{active.draft.length} / 800</span><button className="send-button" disabled={!selectedCount || sent} onClick={sendReplies}>{sent ? <><Check size={16} />Replies sent</> : <><Send size={16} />Reply selected <span>{selectedCount}</span></>}</button></div>{sent && <div className="success-note"><Check size={15} /> {selectedCount} reply results recorded. Nothing else was sent.</div>}{sendError && <div className="error-note">{sendError}</div>}<div className="consent-note">You always choose what gets sent. Comment Relay never auto-replies.</div></section>
+            </div>
+          )}
+        </>
+      )}
     </main>
   </div>
+}
+
+function WorkspaceList({ videos, loading, syncing, error, onSync, onOpen, opening }) {
+  return <>
+    <header className="topbar">
+      <div><div className="eyebrow">WORKSPACE / ALL VIDEOS</div><h1>Which video needs<br /><em>your attention first?</em></h1></div>
+      <div className="top-actions">
+        <button className="secondary-button" onClick={onSync} disabled={syncing}><RefreshCw size={15} className={syncing ? 'spin' : ''} />{syncing ? 'Syncing…' : 'Sync videos'}</button>
+        <button className="avatar avatar-purple">AK</button>
+      </div>
+    </header>
+    {error && <div className="error-note" style={{ marginBottom: 16 }}>{error}</div>}
+    {loading ? <p className="pack-intro">Loading your videos…</p> : videos.length === 0 ? (
+      <div className="rationale" style={{ maxWidth: 480 }}><Sparkles size={15} /><span><strong>No videos synced yet</strong>Click "Sync videos" to pull every video on your channel, ranked by how urgent the comments look.</span></div>
+    ) : (
+      <div className="video-list">
+        {videos.map((video) => <button key={video.id} className="video-card" onClick={() => onOpen(video.id)} disabled={opening}>
+          <div className="video-card-thumb">{video.thumbnailUrl ? <img src={video.thumbnailUrl} alt="" /> : <Video size={22} />}</div>
+          <div className="video-card-body">
+            <strong>{video.title}</strong>
+            <div className="video-card-meta">
+              <span>{video.commentCount} comment{video.commentCount === 1 ? '' : 's'}</span>
+              {video.topPackId && <span className="video-card-pack">{PACK_LABELS[video.topPackId] || video.topPackId}</span>}
+              <span>Synced {formatRelative(video.lastSyncedAt)}</span>
+            </div>
+          </div>
+          <div className="video-card-score" title="Priority score: comment urgency weighted by recency">{video.priorityScore}</div>
+        </button>)}
+      </div>
+    )}
+  </>
 }
 
 createRoot(document.getElementById('root')).render(<StrictMode><App /></StrictMode>)
