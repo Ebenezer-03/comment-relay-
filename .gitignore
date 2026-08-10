@@ -12,3 +12,9 @@ data/
 *.log
 .idea/
 .vscode/
+.vercel
+.env*
+
+.agents/
+.claude/
+skills-lock.json
