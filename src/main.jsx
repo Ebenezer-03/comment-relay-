@@ -1,4 +1,4 @@
-import { StrictMode, useEffect, useMemo, useState } from 'react'
+import { StrictMode, useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { ArrowLeft, Check, ChevronDown, CircleHelp, ExternalLink, Inbox, Link2, MessageCircle, MoreHorizontal, Play, RefreshCw, Send, Sparkles, Video } from 'lucide-react'
 import './styles.css'
@@ -57,6 +57,16 @@ function App() {
   const [workspaceLoading, setWorkspaceLoading] = useState(false)
   const [workspaceSyncing, setWorkspaceSyncing] = useState(false)
   const [workspaceError, setWorkspaceError] = useState('')
+  // Sync is now a resumable background job (server/sync.js) rather than one
+  // blocking call — this tracks its progress so large channels show a bar
+  // instead of a spinner that never seems to finish.
+  const [syncJob, setSyncJob] = useState(null)
+
+  // Per-creator, editable classification categories (server/classify.js).
+  const [categories, setCategories] = useState([])
+  const [categoriesOpen, setCategoriesOpen] = useState(false)
+  const [categoriesLoading, setCategoriesLoading] = useState(false)
+  const [categoriesError, setCategoriesError] = useState('')
 
   // Reply desk: null activeVideo means "show the workspace list" when live,
   // or the built-in demo video when no Google account is connected.
@@ -92,11 +102,35 @@ function App() {
     setWorkspaceLoading(false)
   }
 
+  async function loadCategories() {
+    setCategoriesLoading(true)
+    setCategoriesError('')
+    try {
+      const response = await fetch(`${apiBase}/api/categories`, { headers: { 'X-Relay-Session': liveSession } })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error || 'Could not load categories.')
+      setCategories(data.categories || [])
+    } catch (error) {
+      setCategoriesError(error.message)
+    }
+    setCategoriesLoading(false)
+  }
+
   useEffect(() => {
-    if (liveSession) loadWorkspaceVideos()
+    if (liveSession) {
+      loadWorkspaceVideos()
+      loadCategories()
+    }
   }, [liveSession])
 
+  // Guards against overlapping /api/videos/sync bursts (a ref, not state,
+  // so the check is accurate even between renders) — two bursts racing on
+  // the same job's cursor would step on each other's progress.
+  const syncInFlightRef = useRef(false)
+
   async function syncWorkspaceVideos() {
+    if (syncInFlightRef.current) return
+    syncInFlightRef.current = true
     setWorkspaceSyncing(true)
     setWorkspaceError('')
     try {
@@ -104,10 +138,67 @@ function App() {
       const data = await response.json()
       if (!response.ok) throw new Error(data.error || 'Sync failed.')
       setWorkspaceVideos(data.videos || [])
+      setSyncJob(data.job)
     } catch (error) {
       setWorkspaceError(error.message)
     }
+    syncInFlightRef.current = false
     setWorkspaceSyncing(false)
+  }
+
+  // A single sync click only advances the job for ~20s server-side (see
+  // server/sync.js) — large channels need more turns. While a job is still
+  // running, keep re-triggering the next burst (skipped if one's already in
+  // flight) so the creator doesn't have to keep clicking "Sync videos".
+  useEffect(() => {
+    if (!liveSession || syncJob?.status !== 'running') return
+    const interval = setInterval(() => syncWorkspaceVideos(), 4000)
+    return () => clearInterval(interval)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveSession, syncJob?.status])
+
+  async function saveCategory(packId, fields) {
+    setCategoriesError('')
+    try {
+      const response = await fetch(`${apiBase}/api/categories/${packId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'X-Relay-Session': liveSession },
+        body: JSON.stringify(fields),
+      })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error || 'Could not save category.')
+      setCategories(data.categories || [])
+    } catch (error) {
+      setCategoriesError(error.message)
+    }
+  }
+
+  async function addCategory(fields) {
+    setCategoriesError('')
+    try {
+      const response = await fetch(`${apiBase}/api/categories`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Relay-Session': liveSession },
+        body: JSON.stringify(fields),
+      })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error || 'Could not add category.')
+      setCategories(data.categories || [])
+    } catch (error) {
+      setCategoriesError(error.message)
+    }
+  }
+
+  async function deleteCategory(packId) {
+    setCategoriesError('')
+    try {
+      const response = await fetch(`${apiBase}/api/categories/${packId}`, { method: 'DELETE', headers: { 'X-Relay-Session': liveSession } })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error || 'Could not delete category.')
+      setCategories(data.categories || [])
+    } catch (error) {
+      setCategoriesError(error.message)
+    }
   }
 
   async function openVideo(videoId) {
@@ -166,7 +257,7 @@ function App() {
     setSendError('')
     if (liveSession && activeVideo) {
       try {
-        const response = await fetch(`${apiBase}/api/replies`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Relay-Session': liveSession }, body: JSON.stringify({ parentIds: selectedComments.map((comment) => comment.parentId || comment.id), text: active.draft }) })
+        const response = await fetch(`${apiBase}/api/replies`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Relay-Session': liveSession }, body: JSON.stringify({ videoId: activeVideo.id, parentIds: selectedComments.map((comment) => comment.parentId || comment.id), text: active.draft }) })
         const data = await response.json()
         if (!response.ok) throw new Error(data.error || 'Reply failed')
         const failures = data.results?.filter((result) => !result.ok) || []
@@ -211,6 +302,9 @@ function App() {
           onSync={syncWorkspaceVideos}
           onOpen={openVideo}
           opening={videoLoading}
+          syncJob={syncJob}
+          categories={categories}
+          onEditCategories={() => setCategoriesOpen(true)}
         />
       ) : (
         <>
@@ -250,18 +344,50 @@ function App() {
         </>
       )}
     </main>
+    {categoriesOpen && (
+      <CategoriesPanel
+        categories={categories}
+        loading={categoriesLoading}
+        error={categoriesError}
+        onSave={saveCategory}
+        onAdd={addCategory}
+        onDelete={deleteCategory}
+        onClose={() => setCategoriesOpen(false)}
+      />
+    )}
   </div>
 }
 
-function WorkspaceList({ videos, loading, syncing, error, onSync, onOpen, opening }) {
+function SyncProgress({ job }) {
+  if (!job || job.status === 'done') return null
+  if (job.status === 'error') return <div className="error-note" style={{ marginBottom: 16 }}>Sync failed: {job.error}</div>
+  const pct = job.videosTotal ? Math.round((job.videosProcessed / job.videosTotal) * 100) : 0
+  return (
+    <div className="rationale" style={{ marginBottom: 16, alignItems: 'center' }}>
+      <RefreshCw size={15} className={job.status === 'running' ? 'spin' : ''} />
+      <span style={{ flex: 1 }}>
+        <strong>{job.status === 'paused_quota' ? 'Paused — daily quota reached' : 'Syncing your channel'}</strong>
+        {job.status === 'paused_quota'
+          ? `Picks back up automatically once quota resets. ${job.videosProcessed}/${job.videosTotal} videos done so far.`
+          : `${job.videosProcessed} of ${job.videosTotal} videos processed.`}
+        <div className="progress-bar"><div className="progress-bar-fill" style={{ width: `${pct}%` }} /></div>
+      </span>
+    </div>
+  )
+}
+
+function WorkspaceList({ videos, loading, syncing, error, onSync, onOpen, opening, syncJob, categories, onEditCategories }) {
+  const packLabel = (packId) => categories.find((category) => category.packId === packId)?.label || PACK_LABELS[packId] || packId
   return <>
     <header className="topbar">
       <div><div className="eyebrow">WORKSPACE / ALL VIDEOS</div><h1>Which video needs<br /><em>your attention first?</em></h1></div>
       <div className="top-actions">
+        <button className="secondary-button" onClick={onEditCategories}><Sparkles size={15} />Edit categories</button>
         <button className="secondary-button" onClick={onSync} disabled={syncing}><RefreshCw size={15} className={syncing ? 'spin' : ''} />{syncing ? 'Syncing…' : 'Sync videos'}</button>
         <button className="avatar avatar-purple">AK</button>
       </div>
     </header>
+    <SyncProgress job={syncJob} />
     {error && <div className="error-note" style={{ marginBottom: 16 }}>{error}</div>}
     {loading ? <p className="pack-intro">Loading your videos…</p> : videos.length === 0 ? (
       <div className="rationale" style={{ maxWidth: 480 }}><Sparkles size={15} /><span><strong>No videos synced yet</strong>Click "Sync videos" to pull every video on your channel, ranked by how urgent the comments look.</span></div>
@@ -273,7 +399,7 @@ function WorkspaceList({ videos, loading, syncing, error, onSync, onOpen, openin
             <strong>{video.title}</strong>
             <div className="video-card-meta">
               <span>{video.commentCount} comment{video.commentCount === 1 ? '' : 's'}</span>
-              {video.topPackId && <span className="video-card-pack">{PACK_LABELS[video.topPackId] || video.topPackId}</span>}
+              {video.topPackId && <span className="video-card-pack">{packLabel(video.topPackId)}</span>}
               <span>Synced {formatRelative(video.lastSyncedAt)}</span>
             </div>
           </div>
@@ -282,6 +408,92 @@ function WorkspaceList({ videos, loading, syncing, error, onSync, onOpen, openin
       </div>
     )}
   </>
+}
+
+function CategoryRow({ category, onSave, onDelete }) {
+  const [label, setLabel] = useState(category.label)
+  const [priority, setPriority] = useState(category.priority)
+  const [keywords, setKeywords] = useState((category.keywords || []).join(', '))
+  const [saving, setSaving] = useState(false)
+  const dirty = label !== category.label || priority !== category.priority || keywords !== (category.keywords || []).join(', ')
+
+  async function save() {
+    setSaving(true)
+    await onSave(category.packId, { label, priority, keywords: keywords.split(',').map((word) => word.trim()).filter(Boolean) })
+    setSaving(false)
+  }
+
+  return (
+    <div className="category-row">
+      <span className={`priority-dot ${category.tone}`} />
+      <input value={label} onChange={(event) => setLabel(event.target.value)} />
+      <select value={priority} onChange={(event) => setPriority(event.target.value)}>
+        <option>High</option><option>Medium</option><option>Low</option>
+      </select>
+      <input
+        className="category-keywords"
+        value={keywords}
+        onChange={(event) => setKeywords(event.target.value)}
+        placeholder={category.isFallback ? 'catch-all — no keywords needed' : 'comma-separated trigger words'}
+        disabled={category.isFallback}
+      />
+      <button className="tiny-button" onClick={save} disabled={!dirty || saving}>{saving ? 'Saving…' : 'Save'}</button>
+      {!category.isFallback && <button className="tiny-button" onClick={() => onDelete(category.packId)}>Delete</button>}
+    </div>
+  )
+}
+
+function AddCategoryForm({ onAdd }) {
+  const [packId, setPackId] = useState('')
+  const [label, setLabel] = useState('')
+  const [keywords, setKeywords] = useState('')
+  const [adding, setAdding] = useState(false)
+
+  async function submit(event) {
+    event.preventDefault()
+    if (!packId.trim() || !label.trim()) return
+    setAdding(true)
+    await onAdd({
+      packId: packId.trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-'),
+      label: label.trim(),
+      keywords: keywords.split(',').map((word) => word.trim()).filter(Boolean),
+    })
+    setPackId(''); setLabel(''); setKeywords('')
+    setAdding(false)
+  }
+
+  return (
+    <form className="category-row category-row-add" onSubmit={submit}>
+      <input placeholder="id (e.g. pricing)" value={packId} onChange={(event) => setPackId(event.target.value)} />
+      <input placeholder="Label" value={label} onChange={(event) => setLabel(event.target.value)} />
+      <input className="category-keywords" placeholder="comma-separated trigger words" value={keywords} onChange={(event) => setKeywords(event.target.value)} />
+      <button className="tiny-button" type="submit" disabled={adding}>{adding ? 'Adding…' : 'Add category'}</button>
+    </form>
+  )
+}
+
+// Lets a creator edit the categories their comments are sorted into
+// (server/classify.js) instead of being stuck with one hardcoded, one-niche
+// keyword list. Keywords are matched top-to-bottom, case-insensitive.
+function CategoriesPanel({ categories, loading, error, onSave, onAdd, onDelete, onClose }) {
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-panel" onClick={(event) => event.stopPropagation()}>
+        <div className="panel-head">
+          <div><div className="eyebrow">CLASSIFICATION</div><h2>Categories</h2></div>
+          <button className="tiny-button" onClick={onClose}>Close</button>
+        </div>
+        <p className="pack-intro">Comments are sorted into whichever category matches first, top to bottom. Keywords are matched as substrings, case-insensitive.</p>
+        {error && <div className="error-note">{error}</div>}
+        {loading ? <p className="pack-intro">Loading…</p> : (
+          <div className="category-list">
+            {categories.map((category) => <CategoryRow key={category.packId} category={category} onSave={onSave} onDelete={onDelete} />)}
+            <AddCategoryForm onAdd={onAdd} />
+          </div>
+        )}
+      </div>
+    </div>
+  )
 }
 
 createRoot(document.getElementById('root')).render(<StrictMode><App /></StrictMode>)
