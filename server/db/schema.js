@@ -27,6 +27,7 @@ export const videos = pgTable('videos', {
   lastSyncedAt: timestamp('last_synced_at'),
   priorityScore: integer('priority_score').default(0).notNull(),
   commentCount: integer('comment_count').default(0).notNull(),
+  topPackId: text('top_pack_id'), // the answer-pack category driving priority, e.g. 'install'
 })
 
 // Comments pulled from a video's synced threads.
