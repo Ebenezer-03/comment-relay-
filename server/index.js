@@ -1,8 +1,10 @@
 import crypto from 'node:crypto'
 import express from 'express'
 import { google } from 'googleapis'
-import { eq } from 'drizzle-orm'
+import { eq, desc, sql } from 'drizzle-orm'
 import { getDb, schema } from './db/index.js'
+import { fetchUploadsPlaylistId, fetchAllChannelVideos, fetchVideoCommentCounts, fetchRecentCommentThreads } from './youtube.js'
+import { computePriorityScore } from './priority.js'
 
 const app = express()
 const port = Number(process.env.PORT || 8787)
@@ -16,6 +18,11 @@ const scopes = [
 const oauthStates = new Set()
 
 app.use(express.json())
+app.use((req, res, next) => {
+  const start = Date.now()
+  res.on('finish', () => console.log(`[req] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now() - start}ms)`))
+  next()
+})
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', frontendUrl)
   res.setHeader('Access-Control-Allow-Credentials', 'true')
@@ -50,6 +57,7 @@ function normalizeThreads(items) {
       name: snippet.authorDisplayName || 'YouTube viewer',
       initials: (snippet.authorDisplayName || 'YT').replace(/[^A-Za-z ]/g, '').split(' ').map((part) => part[0]).join('').slice(0, 2).toUpperCase(),
       time: snippet.publishedAt ? new Date(snippet.publishedAt).toLocaleDateString() : 'recently',
+      publishedAt: snippet.publishedAt || null,
       text: snippet.textOriginal || snippet.textDisplay || '',
       likes: snippet.likeCount || 0,
     }
@@ -64,14 +72,33 @@ function classify(comment) {
   return 'other'
 }
 
+const PACK_DEFINITIONS = {
+  install: { label: 'Install error', priority: 'High', tone: 'coral', summary: 'Viewers are blocked installing the MCP SDK.' },
+  env: { label: 'Environment setup', priority: 'Medium', tone: 'amber', summary: 'The API key setup step needs more context.' },
+  praise: { label: 'Positive feedback', priority: 'Low', tone: 'green', summary: 'Viewers are celebrating the clear walkthrough.' },
+  other: { label: 'Needs review', priority: 'Medium', tone: 'amber', summary: 'These comments need a closer look.' },
+}
+
 function clusterComments(comments) {
-  const definitions = {
-    install: { label: 'Install error', priority: 'High', tone: 'coral', summary: 'Viewers are blocked installing the MCP SDK.' },
-    env: { label: 'Environment setup', priority: 'Medium', tone: 'amber', summary: 'The API key setup step needs more context.' },
-    praise: { label: 'Positive feedback', priority: 'Low', tone: 'green', summary: 'Viewers are celebrating the clear walkthrough.' },
-    other: { label: 'Needs review', priority: 'Medium', tone: 'amber', summary: 'These comments need a closer look.' },
-  }
-  return Object.entries(definitions).map(([id, definition]) => ({ id, ...definition, count: comments.filter((comment) => classify(comment) === id).length, comments: comments.filter((comment) => classify(comment) === id), draft: '' })).filter((cluster) => cluster.comments.length)
+  return Object.entries(PACK_DEFINITIONS).map(([id, definition]) => ({ id, ...definition, count: comments.filter((comment) => classify(comment) === id).length, comments: comments.filter((comment) => classify(comment) === id), draft: '' })).filter((cluster) => cluster.comments.length)
+}
+
+// Same shape as clusterComments(), but built from already-classified rows
+// stored in Postgres (server/index.js /api/videos/sync) instead of a live
+// YouTube fetch, and carrying each pack's persisted draft.
+function clustersFromStoredRows(commentRows, draftByPack) {
+  return Object.entries(PACK_DEFINITIONS).map(([id, definition]) => {
+    const packComments = commentRows.filter((row) => row.packId === id).map((row) => ({
+      id: row.id,
+      parentId: row.parentId,
+      name: row.authorName,
+      initials: row.authorInitials,
+      text: row.text,
+      likes: row.likeCount,
+      time: row.publishedAt ? new Date(row.publishedAt).toLocaleDateString() : 'recently',
+    }))
+    return { id, ...definition, count: packComments.length, comments: packComments, draft: draftByPack.get(id) || '' }
+  }).filter((cluster) => cluster.comments.length)
 }
 
 // Session lookup now reads from Postgres instead of an in-memory Map, so
@@ -176,6 +203,155 @@ app.post('/api/replies', async (req, res) => {
   } catch (error) {
     res.status(502).json({ error: error.message || 'Reply submission failed.' })
   }
+})
+
+// Serves the creator's videos from the cache built by /api/videos/sync,
+// ranked by priority. Cheap and quota-free — call this on every workspace
+// load; call sync explicitly (button/refresh) to pull fresh data.
+app.get('/api/videos', async (req, res) => {
+  const session = await sessionFor(req)
+  if (!session) return res.status(401).json({ error: 'Connect a Google account before listing videos.' })
+  const db = getDb()
+  const rows = await db.select().from(schema.videos).where(eq(schema.videos.creatorId, session.creatorId)).orderBy(desc(schema.videos.priorityScore))
+  res.json({ videos: rows })
+})
+
+// Pulls every video on the creator's channel, samples each video's most
+// recent comments to classify and score them, and upserts the results.
+// This is the expensive path (one YouTube API call per video with comments)
+// so it only runs when the creator explicitly asks for a refresh.
+app.post('/api/videos/sync', async (req, res) => {
+  const session = await sessionFor(req)
+  if (!session) return res.status(401).json({ error: 'Connect a Google account before syncing videos.' })
+  try {
+    const client = oauthClient()
+    client.setCredentials(session.tokens)
+    const youtube = google.youtube({ version: 'v3', auth: client })
+
+    const uploadsPlaylistId = await fetchUploadsPlaylistId(youtube, session.creatorId)
+    if (!uploadsPlaylistId) return res.status(502).json({ error: "Could not find this channel's uploads playlist." })
+
+    const channelVideos = await fetchAllChannelVideos(youtube, uploadsPlaylistId)
+    const commentCounts = await fetchVideoCommentCounts(youtube, channelVideos.map((video) => video.id))
+
+    const now = Date.now()
+    const videoRows = []
+    const commentRows = []
+    const answerPackRows = []
+
+    for (const video of channelVideos) {
+      const hasComments = (commentCounts.get(video.id) || 0) > 0
+      const threads = hasComments ? await fetchRecentCommentThreads(youtube, video.id) : []
+      const comments = normalizeThreads(threads)
+      const bucketCounts = { install: 0, env: 0, other: 0, praise: 0 }
+      for (const comment of comments) bucketCounts[classify(comment)]++
+
+      const [topPackId, topCount] = Object.entries(bucketCounts).sort((a, b) => b[1] - a[1])[0]
+      const publishedAt = video.publishedAt ? new Date(video.publishedAt) : null
+
+      videoRows.push({
+        id: video.id,
+        creatorId: session.creatorId,
+        title: video.title,
+        thumbnailUrl: video.thumbnailUrl,
+        publishedAt,
+        lastSyncedAt: new Date(now),
+        priorityScore: computePriorityScore(bucketCounts, publishedAt, now),
+        commentCount: commentCounts.get(video.id) || 0,
+        topPackId: topCount > 0 ? topPackId : null,
+      })
+
+      for (const comment of comments) {
+        commentRows.push({
+          id: comment.id,
+          videoId: video.id,
+          parentId: comment.parentId,
+          authorName: comment.name,
+          authorInitials: comment.initials,
+          text: comment.text,
+          likeCount: comment.likes,
+          publishedAt: comment.publishedAt ? new Date(comment.publishedAt) : null,
+          packId: classify(comment),
+        })
+      }
+
+      for (const packId of new Set(comments.map(classify))) {
+        answerPackRows.push({ videoId: video.id, packId, draft: '' })
+      }
+    }
+
+    const db = getDb()
+    if (videoRows.length) {
+      await db.insert(schema.videos).values(videoRows).onConflictDoUpdate({
+        target: schema.videos.id,
+        set: {
+          title: sql`excluded.title`,
+          thumbnailUrl: sql`excluded.thumbnail_url`,
+          publishedAt: sql`excluded.published_at`,
+          lastSyncedAt: sql`excluded.last_synced_at`,
+          priorityScore: sql`excluded.priority_score`,
+          commentCount: sql`excluded.comment_count`,
+          topPackId: sql`excluded.top_pack_id`,
+        },
+      })
+    }
+    if (commentRows.length) {
+      await db.insert(schema.comments).values(commentRows).onConflictDoUpdate({
+        target: schema.comments.id,
+        set: {
+          authorName: sql`excluded.author_name`,
+          authorInitials: sql`excluded.author_initials`,
+          text: sql`excluded.text`,
+          likeCount: sql`excluded.like_count`,
+          publishedAt: sql`excluded.published_at`,
+          packId: sql`excluded.pack_id`,
+        },
+      })
+    }
+    if (answerPackRows.length) {
+      // Don't clobber a draft the creator already wrote for this pack.
+      await db.insert(schema.answerPacks).values(answerPackRows).onConflictDoNothing()
+    }
+
+    const rows = await db.select().from(schema.videos).where(eq(schema.videos.creatorId, session.creatorId)).orderBy(desc(schema.videos.priorityScore))
+    res.json({ videos: rows })
+  } catch (error) {
+    res.status(error.code === 403 ? 403 : 502).json({ error: error.message || 'Video sync failed.' })
+  }
+})
+
+// Loads one video's cached, classified comments + persisted drafts — no
+// live YouTube call. This is what the reply desk reads when a creator
+// clicks into a video from their workspace list.
+app.get('/api/videos/:id', async (req, res) => {
+  const session = await sessionFor(req)
+  if (!session) return res.status(401).json({ error: 'Connect a Google account before opening a video.' })
+  const db = getDb()
+  const [video] = await db.select().from(schema.videos).where(eq(schema.videos.id, req.params.id)).limit(1)
+  if (!video || video.creatorId !== session.creatorId) return res.status(404).json({ error: 'Video not found.' })
+
+  const [commentRows, packRows] = await Promise.all([
+    db.select().from(schema.comments).where(eq(schema.comments.videoId, video.id)),
+    db.select().from(schema.answerPacks).where(eq(schema.answerPacks.videoId, video.id)),
+  ])
+  const draftByPack = new Map(packRows.map((row) => [row.packId, row.draft]))
+  res.json({ video, clusters: clustersFromStoredRows(commentRows, draftByPack) })
+})
+
+// Persists an edited draft for one video's answer pack.
+app.put('/api/videos/:id/packs/:packId', async (req, res) => {
+  const session = await sessionFor(req)
+  if (!session) return res.status(401).json({ error: 'Connect a Google account before editing a draft.' })
+  const { draft } = req.body || {}
+  if (typeof draft !== 'string') return res.status(400).json({ error: 'draft must be a string.' })
+
+  const db = getDb()
+  const [video] = await db.select().from(schema.videos).where(eq(schema.videos.id, req.params.id)).limit(1)
+  if (!video || video.creatorId !== session.creatorId) return res.status(404).json({ error: 'Video not found.' })
+
+  await db.insert(schema.answerPacks).values({ videoId: req.params.id, packId: req.params.packId, draft })
+    .onConflictDoUpdate({ target: [schema.answerPacks.videoId, schema.answerPacks.packId], set: { draft: sql`excluded.draft` } })
+  res.json({ ok: true })
 })
 
 app.listen(port, () => console.log(`Comment Relay API listening on http://localhost:${port}`))
