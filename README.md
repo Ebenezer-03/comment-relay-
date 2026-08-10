@@ -6,6 +6,7 @@ Comment Relay is a creator-controlled reply desk for one YouTube video. It group
 
 ```bash
 npm install
+npm run db:push   # creates/updates tables in Neon Postgres
 npm run dev
 npm run server
 ```
@@ -13,6 +14,8 @@ npm run server
 The frontend runs at `http://localhost:5173` and the API runs at `http://localhost:8787`.
 
 The frontend still falls back to seeded comments when the API is not configured. To enable live YouTube data, copy `.env.example` to `.env`, create a Google OAuth web client, add `http://localhost:8787/api/oauth2callback` as an authorized redirect URI, and fill in the client credentials. The backend uses `commentThreads.list` for sync and `comments.insert` only for explicitly selected replies.
+
+Data — creators, OAuth sessions, videos, comments, answer packs, sent replies — is persisted in Neon Postgres (provisioned via the Vercel Marketplace; `DATABASE_URL` and friends live in `.env.local`, pulled with `vercel env pull`). A creator's identity is their YouTube channel, so signing in with Google links replies and history to that channel rather than a per-server session that resets on restart.
 
 ## How comments are grouped
 
