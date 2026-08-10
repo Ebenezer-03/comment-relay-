@@ -1,13 +1,18 @@
 import crypto from 'node:crypto'
 import express from 'express'
 import { google } from 'googleapis'
+import { eq } from 'drizzle-orm'
+import { getDb, schema } from './db/index.js'
 
 const app = express()
 const port = Number(process.env.PORT || 8787)
 const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173'
 const hasGoogleConfig = Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET)
-const scopes = ['https://www.googleapis.com/auth/youtube.force-ssl']
-const sessions = new Map()
+const scopes = [
+  'https://www.googleapis.com/auth/youtube.force-ssl',
+  'https://www.googleapis.com/auth/userinfo.email',
+  'openid',
+]
 const oauthStates = new Set()
 
 app.use(express.json())
@@ -69,12 +74,20 @@ function clusterComments(comments) {
   return Object.entries(definitions).map(([id, definition]) => ({ id, ...definition, count: comments.filter((comment) => classify(comment) === id).length, comments: comments.filter((comment) => classify(comment) === id), draft: '' })).filter((cluster) => cluster.comments.length)
 }
 
-function sessionFor(req) {
-  return sessions.get(req.header('X-Relay-Session'))
+// Session lookup now reads from Postgres instead of an in-memory Map, so
+// creators stay signed in across server restarts/redeploys.
+async function sessionFor(req) {
+  const sessionId = req.header('X-Relay-Session')
+  if (!sessionId) return null
+  const db = getDb()
+  const [row] = await db.select().from(schema.sessions).where(eq(schema.sessions.id, sessionId)).limit(1)
+  if (!row) return null
+  return { tokens: row.tokens, creatorId: row.creatorId }
 }
 
-app.get('/api/auth/status', (req, res) => {
-  res.json({ configured: hasGoogleConfig, connected: Boolean(sessionFor(req)) })
+app.get('/api/auth/status', async (req, res) => {
+  const session = await sessionFor(req)
+  res.json({ configured: hasGoogleConfig, connected: Boolean(session) })
 })
 
 app.get('/api/auth/google', (req, res) => {
@@ -89,27 +102,52 @@ app.get('/api/oauth2callback', async (req, res) => {
   if (!code || !state || !oauthStates.has(state)) return res.status(400).send('Invalid OAuth callback.')
   oauthStates.delete(state)
   try {
-    const { tokens } = await oauthClient().getToken(code)
+    const client = oauthClient()
+    const { tokens } = await client.getToken(code)
+    client.setCredentials(tokens)
+
+    // Identify the creator: use their YouTube channel as the stable identity,
+    // and their Google account for email/profile display.
+    const [userinfo, channelResponse] = await Promise.all([
+      google.oauth2('v2').userinfo.get({ auth: client }),
+      google.youtube({ version: 'v3', auth: client }).channels.list({ mine: true, part: ['snippet'] }),
+    ])
+    const channel = channelResponse.data.items?.[0]
+    if (!channel) return res.status(502).send('No YouTube channel found on this Google account.')
+
+    const db = getDb()
+    await db.insert(schema.creators).values({
+      id: channel.id,
+      googleSub: userinfo.data.id,
+      email: userinfo.data.email,
+      channelTitle: channel.snippet?.title,
+    }).onConflictDoUpdate({
+      target: schema.creators.id,
+      set: { googleSub: userinfo.data.id, email: userinfo.data.email, channelTitle: channel.snippet?.title },
+    })
+
     const sessionId = crypto.randomBytes(24).toString('hex')
-    sessions.set(sessionId, tokens)
+    await db.insert(schema.sessions).values({ id: sessionId, creatorId: channel.id, tokens })
+
     res.redirect(`${frontendUrl}/?session=${sessionId}`)
   } catch (error) {
     res.status(502).send(`Google OAuth failed: ${error.message}`)
   }
 })
 
-app.post('/api/auth/disconnect', (req, res) => {
-  sessions.delete(req.header('X-Relay-Session'))
+app.post('/api/auth/disconnect', async (req, res) => {
+  const sessionId = req.header('X-Relay-Session')
+  if (sessionId) await getDb().delete(schema.sessions).where(eq(schema.sessions.id, sessionId))
   res.json({ connected: false })
 })
 
 app.get('/api/comments', async (req, res) => {
   const videoId = videoIdFromUrl(req.query.videoId)
   if (!videoId) return res.status(400).json({ error: 'Provide a valid YouTube URL or 11-character video ID.' })
-  const tokens = sessionFor(req)
-  if (!tokens) return res.status(401).json({ error: 'Connect a Google account before syncing live comments.' })
+  const session = await sessionFor(req)
+  if (!session) return res.status(401).json({ error: 'Connect a Google account before syncing live comments.' })
   try {
-    const youtube = google.youtube({ version: 'v3', auth: Object.assign(oauthClient(), { credentials: tokens }) })
+    const youtube = google.youtube({ version: 'v3', auth: Object.assign(oauthClient(), { credentials: session.tokens }) })
     const response = await youtube.commentThreads.list({ part: ['snippet', 'replies'], videoId, maxResults: 100, order: 'time', textFormat: 'plainText' })
     const comments = normalizeThreads(response.data.items || [])
     res.json({ videoId, fetched: comments.length, clusters: clusterComments(comments) })
@@ -120,11 +158,11 @@ app.get('/api/comments', async (req, res) => {
 
 app.post('/api/replies', async (req, res) => {
   const { parentIds, text } = req.body || {}
-  const tokens = sessionFor(req)
-  if (!tokens) return res.status(401).json({ error: 'Connect a Google account before sending replies.' })
+  const session = await sessionFor(req)
+  if (!session) return res.status(401).json({ error: 'Connect a Google account before sending replies.' })
   if (!Array.isArray(parentIds) || !parentIds.length || !text?.trim()) return res.status(400).json({ error: 'Select at least one comment and provide reply text.' })
   try {
-    const youtube = google.youtube({ version: 'v3', auth: Object.assign(oauthClient(), { credentials: tokens }) })
+    const youtube = google.youtube({ version: 'v3', auth: Object.assign(oauthClient(), { credentials: session.tokens }) })
     const results = []
     for (const parentId of parentIds) {
       try {
