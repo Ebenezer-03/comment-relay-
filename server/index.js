@@ -19,6 +19,11 @@ const oauthStates = new Set()
 
 app.use(express.json())
 app.use((req, res, next) => {
+  const start = Date.now()
+  res.on('finish', () => console.log(`[req] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now() - start}ms)`))
+  next()
+})
+app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', frontendUrl)
   res.setHeader('Access-Control-Allow-Credentials', 'true')
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Relay-Session')
