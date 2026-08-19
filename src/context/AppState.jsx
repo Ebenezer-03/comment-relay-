@@ -126,12 +126,45 @@ export function AppStateProvider({ children }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveSession, videosOffset])
 
+  // Reads job progress without triggering a burst. GET /api/videos/sync/status
+  // has existed since sync became resumable but nothing ever called it — the
+  // frontend re-POSTed the expensive burst endpoint just to learn the status,
+  // and a job the cron started was invisible until the creator clicked Sync.
+  const refreshSyncStatus = useCallback(async () => {
+    if (!liveSession) return null
+    try {
+      const data = await apiFetch('/api/videos/sync/status', { session: liveSession })
+      setSyncJob(data.job)
+      return data.job
+    } catch {
+      return null // transient; the next tick will try again
+    }
+  }, [liveSession])
+
+  // Pick up a job already in flight (started by the cron, or by this creator
+  // in another tab) as soon as the workspace loads.
+  useEffect(() => { refreshSyncStatus() }, [refreshSyncStatus])
+
   // A single sync click only advances the job for ~20s server-side — large
-  // channels need more turns. While a job is still running, keep
-  // re-triggering the next burst so the creator doesn't have to keep clicking.
+  // channels need more turns.
+  //
+  // 'running'      -> keep triggering the next burst so the creator doesn't
+  //                   have to keep clicking.
+  // 'paused_quota' -> do NOT burst (it would just be refused); poll status
+  //                   instead. This case used to fall out of the effect
+  //                   entirely, freezing the progress bar until a manual
+  //                   click, even after the cron had resumed the job.
   useEffect(() => {
-    if (!liveSession || syncJob?.status !== 'running') return
-    const interval = setInterval(() => syncWorkspaceVideos(), 4000)
+    const status = syncJob?.status
+    if (!liveSession || (status !== 'running' && status !== 'paused_quota')) return
+    const advancing = status === 'running'
+    const interval = setInterval(async () => {
+      if (advancing) return syncWorkspaceVideos()
+      const job = await refreshSyncStatus()
+      // Quota freed up and something else restarted us — reload the list so
+      // newly-ranked videos appear.
+      if (job?.status === 'running' || job?.status === 'done') loadWorkspaceVideos(videosOffset)
+    }, advancing ? 4000 : 30000)
     return () => clearInterval(interval)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveSession, syncJob?.status])
@@ -280,13 +313,17 @@ export function AppStateProvider({ children }) {
   }
 
   const selectedCount = active ? active.comments.filter((comment) => selected.includes(comment.id)).length : 0
-  const totalQuestions = clusters.reduce((sum, cluster) => sum + (cluster.id === 'praise' ? 0 : cluster.count), 0)
+  // "Questions" = everything that isn't low-priority chatter. Keyed off the
+  // category's own priority rather than the literal pack id 'praise', which
+  // only existed in the default category set — a creator who renamed or
+  // replaced it had their praise counted as questions.
+  const totalQuestions = clusters.reduce((sum, cluster) => sum + (cluster.priority === 'Low' ? 0 : cluster.count), 0)
   const selectedComments = active ? active.comments.filter((comment) => selected.includes(comment.id)) : []
 
   const value = {
     liveSession, configured, creator,
     workspaceVideos, videosTotal, videosOffset, videosLimit, workspaceLoading, workspaceSyncing, workspaceError, syncJob,
-    loadWorkspaceVideos, syncWorkspaceVideos,
+    loadWorkspaceVideos, syncWorkspaceVideos, refreshSyncStatus,
     categories, categoriesOpen, setCategoriesOpen, categoriesLoading, categoriesError, saveCategory, addCategory, deleteCategory,
     activeVideo, videoLoading, clusters, active, activeId, setActiveId, selected, setSelected, sent, sendError,
     openVideo, backToWorkspace, toggleComment, changeDraft, saveDraft, changeContext, saveContext, sendReplies,

@@ -2,16 +2,17 @@ import crypto from 'node:crypto'
 import express from 'express'
 import { google } from 'googleapis'
 import { APICallError } from 'ai'
-import { eq, and, gt, desc, sql } from 'drizzle-orm'
+import { eq, and, gt, desc, sql, inArray } from 'drizzle-orm'
 import { getDb, schema } from './db/index.js'
 import { normalizeThreads } from './youtube.js'
 import { encryptJSON, decryptJSON } from './crypto.js'
+import { createState, verifyState } from './oauthState.js'
 import { getCategories, buildClassifier, seedDefaultCategories, clusterByCategory } from './classify.js'
 import { runSyncBurst, tickSyncJob, listActiveJobs } from './sync.js'
-import { recordUsage, UNIT_COSTS } from './quota.js'
+import { checkBudget, recordUsage, UNIT_COSTS } from './quota.js'
 import { parsePagination } from './pagination.js'
 import { classifyCommentsWithAI, generateDraftWithAI } from './ai.js'
-import { computePriorityScore } from './priority.js'
+import { computePriorityScore, weightsFromCategories } from './priority.js'
 
 const app = express()
 const port = Number(process.env.PORT || 8787)
@@ -22,8 +23,6 @@ const scopes = [
   'https://www.googleapis.com/auth/userinfo.email',
   'openid',
 ]
-const oauthStates = new Set()
-
 app.use(express.json())
 app.use((req, res, next) => {
   const start = Date.now()
@@ -43,6 +42,23 @@ function oauthClient() {
   return new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET, process.env.GOOGLE_REDIRECT_URI || `${frontendUrl}/api/oauth2callback`)
 }
 
+// Caps one reply batch. 25 x 50 units = 1250, just under the default
+// per-creator daily cap, so a single click can never drain the shared pool.
+const MAX_REPLY_BATCH = 25
+
+// Turns a checkBudget() refusal into copy a creator can act on.
+function quotaMessage(budget) {
+  return budget.reason === 'creator_cap'
+    ? "You've reached your daily YouTube API quota. It resets at midnight Pacific Time."
+    : "The shared daily YouTube API quota is exhausted. It resets at midnight Pacific Time."
+}
+
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
+
+// Only re-stamp expires_at once the session has aged a day, so an active
+// creator costs one extra write per day rather than one per request.
+const SESSION_SLIDE_AFTER_MS = 24 * 60 * 60 * 1000
+
 function videoIdFromUrl(input) {
   if (!input) return null
   if (/^[A-Za-z0-9_-]{11}$/.test(input)) return input
@@ -58,7 +74,8 @@ function videoIdFromUrl(input) {
 // Session lookup reads from Postgres (not an in-memory Map), so creators
 // stay signed in across server restarts/redeploys. Tokens are stored as an
 // encrypted envelope (server/crypto.js) and decrypted only here. Expired
-// sessions (sessions.expires_at) are rejected and cleaned up on read.
+// sessions (sessions.expires_at) are rejected and cleaned up on read, and a
+// session in active use has its expiry slid forward.
 async function sessionFor(req) {
   const sessionId = req.header('X-Relay-Session')
   if (!sessionId) return null
@@ -69,7 +86,43 @@ async function sessionFor(req) {
     await db.delete(schema.sessions).where(eq(schema.sessions.id, sessionId))
     return null
   }
-  return { tokens: decryptJSON(row.tokens), creatorId: row.creatorId }
+  // Actually slide the expiry the schema comment always promised. Before
+  // this, expires_at was stamped once at sign-in and never moved, so a
+  // creator using the app every day was still logged out on day 30.
+  const remaining = row.expiresAt ? row.expiresAt.getTime() - Date.now() : 0
+  if (remaining < SESSION_TTL_MS - SESSION_SLIDE_AFTER_MS) {
+    await db.update(schema.sessions)
+      .set({ expiresAt: new Date(Date.now() + SESSION_TTL_MS) })
+      .where(eq(schema.sessions.id, sessionId))
+  }
+  return { id: row.id, tokens: decryptJSON(row.tokens), creatorId: row.creatorId }
+}
+
+// Builds an OAuth client for a session and — crucially — writes refreshed
+// tokens back. googleapis silently refreshes an expired access token using
+// the stored refresh_token, but the refreshed credentials only lived in that
+// one request's client object: every subsequent request paid another refresh
+// round-trip to Google. Persisting them means one refresh per hour, not one
+// per request.
+function clientForSession(session) {
+  const client = oauthClient()
+  client.setCredentials(session.tokens)
+  client.on('tokens', (fresh) => {
+    // Google omits refresh_token on a refresh response — merge so we don't
+    // drop the only thing that lets us refresh again.
+    const merged = { ...session.tokens, ...fresh }
+    getDb().update(schema.sessions).set({ tokens: encryptJSON(merged) })
+      .where(eq(schema.sessions.id, session.id))
+      .catch((error) => console.error('[session] failed to persist refreshed tokens', error))
+  })
+  return client
+}
+
+// Single construction path for an authenticated YouTube client. Replaces
+// three slightly different inline spellings, one of which
+// (`Object.assign(oauthClient(), { credentials })`) bypassed setCredentials.
+function youtubeForSession(session) {
+  return google.youtube({ version: 'v3', auth: clientForSession(session) })
 }
 
 // Express middleware wrapping sessionFor() — factored out so the ~15
@@ -92,11 +145,13 @@ function requireSession(message) {
 
 // Looks up a creator's most recent non-expired session, for the cron-driven
 // sync tick (which has no browser session header of its own to read).
-async function latestSessionTokensForCreator(db, creatorId) {
+// Returns the same { id, tokens, creatorId } shape sessionFor() does, so the
+// tick can reuse youtubeForSession() and get refresh-token persistence too.
+async function latestSessionForCreator(db, creatorId) {
   const [row] = await db.select().from(schema.sessions)
     .where(and(eq(schema.sessions.creatorId, creatorId), gt(schema.sessions.expiresAt, new Date())))
     .orderBy(desc(schema.sessions.createdAt)).limit(1)
-  return row ? decryptJSON(row.tokens) : null
+  return row ? { id: row.id, tokens: decryptJSON(row.tokens), creatorId } : null
 }
 
 // Maps AI Gateway errors (server/ai.js) to a status/message pair per the
@@ -134,15 +189,15 @@ app.get('/api/auth/status', async (req, res) => {
 
 app.get('/api/auth/google', (req, res) => {
   if (!hasGoogleConfig) return res.status(503).json({ error: 'Google OAuth is not configured. Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.' })
-  const state = crypto.randomBytes(24).toString('hex')
-  oauthStates.add(state)
+  // Signed rather than stored — see server/oauthState.js for why an
+  // in-memory Set couldn't work across instances or restarts.
+  const state = createState()
   res.redirect(oauthClient().generateAuthUrl({ access_type: 'offline', scope: scopes, state, prompt: 'consent' }))
 })
 
 app.get('/api/oauth2callback', async (req, res) => {
   const { code, state } = req.query
-  if (!code || !state || !oauthStates.has(state)) return res.status(400).send('Invalid OAuth callback.')
-  oauthStates.delete(state)
+  if (!code || !verifyState(state)) return res.status(400).send('Invalid or expired OAuth callback. Please try connecting again.')
   try {
     const client = oauthClient()
     const { tokens } = await client.getToken(code)
@@ -194,9 +249,11 @@ app.get('/api/comments', requireSession('Connect a Google account before syncing
   const session = req.session
   try {
     const db = getDb()
+    const budget = await checkBudget(db, session.creatorId, UNIT_COSTS.list)
+    if (!budget.allowed) return res.status(429).json({ error: quotaMessage(budget) })
     const categories = await getCategories(db, session.creatorId)
     const classify = buildClassifier(categories)
-    const youtube = google.youtube({ version: 'v3', auth: Object.assign(oauthClient(), { credentials: session.tokens }) })
+    const youtube = youtubeForSession(session)
     const response = await youtube.commentThreads.list({ part: ['snippet', 'replies'], videoId, maxResults: 100, order: 'time', textFormat: 'plainText' })
     await recordUsage(db, session.creatorId, UNIT_COSTS.list)
     const comments = normalizeThreads(response.data.items || []).map((comment) => ({ ...comment, packId: classify(comment.text) }))
@@ -212,13 +269,25 @@ app.post('/api/replies', requireSession('Connect a Google account before sending
   if (!videoId || !Array.isArray(parentIds) || !parentIds.length || !text?.trim()) {
     return res.status(400).json({ error: 'Provide a videoId, at least one selected comment, and reply text.' })
   }
+  // comments.insert is by far the most expensive call the app makes (50
+  // units each, versus 1 for every read). parentIds was unbounded, so a
+  // single request could spend the entire shared daily pool.
+  if (parentIds.length > MAX_REPLY_BATCH) {
+    return res.status(400).json({ error: `Reply to at most ${MAX_REPLY_BATCH} comments at a time.` })
+  }
   const db = getDb()
   const [video] = await db.select().from(schema.videos).where(eq(schema.videos.id, videoId)).limit(1)
   if (!video || video.creatorId !== session.creatorId) return res.status(404).json({ error: 'Video not found.' })
 
+  // The quota ledger was recorded against but never *checked* here — the
+  // one write path in the app, and the only one that could exhaust the pool
+  // in a single request, was the one path that skipped the budget gate.
+  const budget = await checkBudget(db, session.creatorId, parentIds.length * UNIT_COSTS.commentInsert)
+  if (!budget.allowed) return res.status(429).json({ error: quotaMessage(budget) })
+
+  const results = []
   try {
-    const youtube = google.youtube({ version: 'v3', auth: Object.assign(oauthClient(), { credentials: session.tokens }) })
-    const results = []
+    const youtube = youtubeForSession(session)
     for (const parentId of parentIds) {
       try {
         const response = await youtube.comments.insert({ part: ['snippet'], requestBody: { snippet: { parentId, textOriginal: text.trim() } } })
@@ -227,7 +296,6 @@ app.post('/api/replies', requireSession('Connect a Google account before sending
         results.push({ parentId, ok: false, error: error.message })
       }
     }
-    await recordUsage(db, session.creatorId, results.length * UNIT_COSTS.commentInsert)
     // Real send history — sentReplies existed in the schema but nothing
     // wrote to it before. `ok` reflects whether every selected reply in
     // this batch succeeded.
@@ -242,6 +310,14 @@ app.post('/api/replies', requireSession('Connect a Google account before sending
     res.json({ results })
   } catch (error) {
     res.status(502).json({ error: error.message || 'Reply submission failed.' })
+  } finally {
+    // Charge for every insert actually attempted, even if the handler threw
+    // partway through. Previously an exception skipped recordUsage entirely,
+    // so real spend went unaccounted and the ledger drifted below reality.
+    if (results.length) {
+      await recordUsage(db, session.creatorId, results.length * UNIT_COSTS.commentInsert)
+        .catch((error) => console.error('[quota] failed to record reply usage', error))
+    }
   }
 })
 
@@ -267,14 +343,14 @@ app.get('/api/videos', requireSession('Connect a Google account before listing v
 app.post('/api/videos/sync', requireSession('Connect a Google account before syncing videos.'), async (req, res) => {
   const session = req.session
   try {
-    const client = oauthClient()
-    client.setCredentials(session.tokens)
-    const youtube = google.youtube({ version: 'v3', auth: client })
+    const youtube = youtubeForSession(session)
     const db = getDb()
 
-    const job = await runSyncBurst(db, session.creatorId, youtube)
+    // claimed:false means the cron tick or another tab is already advancing
+    // this job — report its state instead of racing it (server/sync.js).
+    const { job, claimed } = await runSyncBurst(db, session.creatorId, youtube)
     const rows = await db.select().from(schema.videos).where(eq(schema.videos.creatorId, session.creatorId)).orderBy(desc(schema.videos.priorityScore))
-    res.json({ job: publicJob(job), videos: rows })
+    res.json({ job: publicJob(job), claimed, videos: rows })
   } catch (error) {
     res.status(error.code === 403 ? 403 : 502).json({ error: error.message || 'Video sync failed.' })
   }
@@ -303,15 +379,16 @@ app.get('/api/internal/sync/tick', async (req, res) => {
   const results = []
   for (const job of jobs) {
     try {
-      const tokens = await latestSessionTokensForCreator(db, job.creatorId)
-      if (!tokens) {
+      const session = await latestSessionForCreator(db, job.creatorId)
+      if (!session) {
         results.push({ jobId: job.id, skipped: 'no valid session for this creator' })
         continue
       }
-      const client = oauthClient()
-      client.setCredentials(tokens)
-      const youtube = google.youtube({ version: 'v3', auth: client })
-      const updated = await tickSyncJob(db, job, youtube)
+      const updated = await tickSyncJob(db, job, youtubeForSession(session))
+      if (!updated) {
+        results.push({ jobId: job.id, skipped: 'already claimed by an in-flight sync' })
+        continue
+      }
       results.push({ jobId: job.id, status: updated.status, videosProcessed: updated.videosProcessed, videosTotal: updated.videosTotal })
     } catch (error) {
       results.push({ jobId: job.id, error: error.message })
@@ -388,11 +465,19 @@ app.post('/api/videos/:id/reclassify', requireSession('Connect a Google account 
 
   try {
     const packIds = await classifyCommentsWithAI(commentRows.map((row) => ({ id: row.id, text: row.text })), categories)
-    await Promise.all(
-      commentRows
-        .filter((row) => packIds.has(row.id) && packIds.get(row.id) !== row.packId)
-        .map((row) => db.update(schema.comments).set({ packId: packIds.get(row.id) }).where(eq(schema.comments.id, row.id)))
-    )
+    const changed = commentRows.filter((row) => packIds.has(row.id) && packIds.get(row.id) !== row.packId)
+    // One statement, not one per comment. This was a Promise.all over
+    // individual UPDATEs, and neon-http sends every statement as its own
+    // HTTP round-trip — reclassifying a 100-comment video meant 100 of them.
+    if (changed.length) {
+      const cases = sql.join(
+        changed.map((row) => sql`when ${schema.comments.id} = ${row.id} then ${packIds.get(row.id)}`),
+        sql` `,
+      )
+      await db.update(schema.comments)
+        .set({ packId: sql`case ${cases} else ${schema.comments.packId} end` })
+        .where(inArray(schema.comments.id, changed.map((row) => row.id)))
+    }
 
     const bucketCounts = {}
     for (const row of commentRows) {
@@ -400,7 +485,9 @@ app.post('/api/videos/:id/reclassify', requireSession('Connect a Google account 
       bucketCounts[packId] = (bucketCounts[packId] || 0) + 1
     }
     const topPackId = Object.entries(bucketCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || video.topPackId
-    const priorityScore = computePriorityScore(bucketCounts, video.publishedAt)
+    // Weighted by the creator's own category priorities, matching what
+    // server/sync.js does — not the old hardcoded default-pack weights.
+    const priorityScore = computePriorityScore(bucketCounts, video.publishedAt, Date.now(), weightsFromCategories(categories))
     await db.update(schema.videos).set({ topPackId, priorityScore }).where(eq(schema.videos.id, video.id))
 
     const [packRows] = await Promise.all([db.select().from(schema.answerPacks).where(eq(schema.answerPacks.videoId, video.id))])
@@ -543,6 +630,22 @@ app.delete('/api/categories/:packId', requireSession('Connect a Google account b
   if (target.isFallback) return res.status(400).json({ error: 'The catch-all category cannot be deleted.' })
   if (existing.length <= 1) return res.status(400).json({ error: 'At least one category must remain.' })
 
+  // Move this category's comments to the catch-all before deleting it.
+  // comments.pack_id is a loose string reference with no FK, and
+  // clusterByCategory() drops any cluster with no matching category — so
+  // deleting a category used to make its comments silently disappear from
+  // the reply desk with no way to get them back.
+  const fallback = existing.find((category) => category.isFallback) || existing.find((category) => category.packId !== target.packId)
+  await db.update(schema.comments)
+    .set({ packId: fallback.packId })
+    .where(and(
+      eq(schema.comments.packId, target.packId),
+      inArray(
+        schema.comments.videoId,
+        db.select({ id: schema.videos.id }).from(schema.videos).where(eq(schema.videos.creatorId, session.creatorId)),
+      ),
+    ))
+
   await db.delete(schema.categories).where(and(eq(schema.categories.creatorId, session.creatorId), eq(schema.categories.packId, req.params.packId)))
   res.json({ categories: await getCategories(db, session.creatorId) })
 })
@@ -558,4 +661,12 @@ app.use((error, req, res, next) => {
   res.status(500).json({ error: 'Internal server error.' })
 })
 
-app.listen(port, () => console.log(`Comment Relay API listening on http://localhost:${port}`))
+// On Vercel the app is imported by api/index.js and driven per-request by
+// the platform — calling listen() there would bind a port nothing routes to.
+// Locally (`npm run server`) this is still a normal long-lived Express
+// process, so keep listening when we're not running as a function.
+if (!process.env.VERCEL) {
+  app.listen(port, () => console.log(`Comment Relay API listening on http://localhost:${port}`))
+}
+
+export default app

@@ -21,8 +21,24 @@ export const UNIT_COSTS = {
 
 const GLOBAL_SCOPE = '__global__'
 
-export function todayUTC(now = new Date()) {
-  return now.toISOString().slice(0, 10) // 'YYYY-MM-DD'
+// Google's YouTube Data API quota resets at midnight Pacific Time, not
+// midnight UTC. Bucketing the ledger by UTC day put our accounting 7-8 hours
+// out of step with Google's: for most of the evening (PT) our counter had
+// already rolled over while Google's had not, so a creator could be told
+// they had budget when the real pool was exhausted.
+const QUOTA_TIME_ZONE = 'America/Los_Angeles'
+
+// en-CA formats as 'YYYY-MM-DD', which is what the quota_usage.day column
+// stores and what sorts correctly as text.
+const dayFormatter = new Intl.DateTimeFormat('en-CA', {
+  timeZone: QUOTA_TIME_ZONE,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+})
+
+export function quotaDay(now = new Date()) {
+  return dayFormatter.format(now)
 }
 
 // Pure budget decision, factored out so it's testable without a database.
@@ -59,13 +75,13 @@ async function upsertUsage(db, creatorId, day, units) {
 // shared '__global__' aggregate for today (UTC).
 export async function recordUsage(db, creatorId, units) {
   if (!units) return
-  const day = todayUTC()
+  const day = quotaDay()
   await upsertUsage(db, creatorId, day, units)
   await upsertUsage(db, GLOBAL_SCOPE, day, units)
 }
 
 async function unitsUsedToday(db, creatorId) {
-  const day = todayUTC()
+  const day = quotaDay()
   const [row] = await db.select().from(schema.quotaUsage)
     .where(and(eq(schema.quotaUsage.creatorId, creatorId), eq(schema.quotaUsage.day, day))).limit(1)
   return row?.unitsUsed || 0

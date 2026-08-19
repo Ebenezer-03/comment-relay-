@@ -1,9 +1,22 @@
 import { describe, it, expect } from 'vitest'
-import { evaluateBudget, todayUTC } from './quota.js'
+import { evaluateBudget, quotaDay } from './quota.js'
 
-describe('todayUTC', () => {
+describe('quotaDay', () => {
   it('formats as YYYY-MM-DD', () => {
-    expect(todayUTC(new Date('2026-03-05T23:59:00Z'))).toBe('2026-03-05')
+    expect(quotaDay(new Date('2026-03-05T18:00:00Z'))).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+  })
+
+  // Google's quota resets at midnight Pacific, so 23:59 UTC on the 5th is
+  // still the afternoon of the 5th in PT -- the same quota day, not the next.
+  it('buckets by Pacific Time, not UTC', () => {
+    expect(quotaDay(new Date('2026-03-05T23:59:00Z'))).toBe('2026-03-05')
+    expect(quotaDay(new Date('2026-03-06T01:00:00Z'))).toBe('2026-03-05')
+  })
+
+  it('rolls over at midnight Pacific', () => {
+    // 2026-03-06T07:59Z is 23:59 PST on the 5th; 08:01Z is 00:01 on the 6th.
+    expect(quotaDay(new Date('2026-03-06T07:59:00Z'))).toBe('2026-03-05')
+    expect(quotaDay(new Date('2026-03-06T08:01:00Z'))).toBe('2026-03-06')
   })
 })
 

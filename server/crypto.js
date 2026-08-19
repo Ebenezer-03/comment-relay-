@@ -30,6 +30,15 @@ function getKey() {
   return _key
 }
 
+// Exposes the raw key bytes for other keyed primitives derived from the same
+// secret -- today, the HMAC that signs the OAuth `state` parameter
+// (server/oauthState.js). Sharing one secret keeps deployment to a single
+// required env var; the two uses are domain-separated by algorithm and by
+// the HMAC's own label, so neither can forge input for the other.
+export function getSecretKey() {
+  return getKey()
+}
+
 // Encrypts a JSON-serializable value into a { iv, tag, data } envelope
 // (all base64 strings) suitable for storing directly in a jsonb column.
 export function encryptJSON(value) {

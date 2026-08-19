@@ -110,6 +110,13 @@ export const syncJobs = pgTable('sync_jobs', {
   videosTotal: integer('videos_total').default(0).notNull(),
   videosProcessed: integer('videos_processed').default(0).notNull(),
   error: text('error'),
+  // Cooperative lease. Both the creator's own POST /api/videos/sync and the
+  // every-minute cron tick advance jobs, and nothing stopped them running at
+  // once: two workers would read the same cursor, do the same YouTube calls
+  // (double-charging quota), and the slower one's write would move `index`
+  // backwards. A worker now claims the job by CAS-ing this column forward
+  // and only proceeds if the claim succeeded. See server/sync.js: claimJob.
+  lockedUntil: timestamp('locked_until'),
   startedAt: timestamp('started_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 }, (table) => [index('sync_jobs_creator_id_status_idx').on(table.creatorId, table.status)])

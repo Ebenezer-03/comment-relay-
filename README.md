@@ -1,6 +1,6 @@
 # Comment Relay
 
-Comment Relay is a creator-controlled reply desk for a YouTube channel. Once connected, a creator lands on a ranked list of their videos (weighted by comment urgency and recency), picks one, and works a reply desk that groups repeated learner questions into answer packs, drafts a response from creator context, and requires explicit selection before anything can be sent.
+Comment Relay is a creator-controlled reply desk for a YouTube channel. Once connected, a creator lands on a ranked list of their videos (weighted by comment urgency and recency, using each category's own priority label), picks one, and works a reply desk that groups repeated learner questions into answer packs, drafts a response from creator context, and requires explicit selection before anything can be sent.
 
 Built for multiple creators to use independently — see [Multi-tenancy and quota](#multi-tenancy-and-quota) for how it keeps one creator's usage from affecting another's.
 
@@ -34,6 +34,17 @@ The API logs every request (method, path, status code, duration) to the console 
 | `CRON_SECRET` | Shared secret Vercel Cron sends when triggering the background sync tick — generate the same way |
 | `DAILY_QUOTA_BUDGET` / `PER_CREATOR_DAILY_QUOTA` | YouTube API quota ledger caps — see below |
 
+## Deploying
+
+One Vercel project serves both halves:
+
+- The **frontend** is the Vite build (`npm run build` -> `dist/`).
+- The **API** is the Express app in `server/index.js`, wrapped as a single serverless function by `api/index.js`. An Express app is already a `(req, res)` handler, so exporting it is all Vercel needs.
+- `vercel.ts` rewrites `/api/(.*)` to that function and everything else to `index.html` (react-router owns `/videos`, `/sent`, `/reply-desk/:id`, none of which exist on disk). Rewrites run after the filesystem check, so real static assets still win.
+- `server/index.js` only calls `app.listen()` when `process.env.VERCEL` is unset, so `npm run server` still runs a normal long-lived process locally.
+
+Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, `DATABASE_URL`, `SESSION_ENCRYPTION_KEY`, `CRON_SECRET`, and `FRONTEND_URL` as project environment variables, and add the deployed `/api/oauth2callback` URL to the Google OAuth client's authorized redirect URIs.
+
 ## AI features (reclassify & draft generation)
 
 Two reply-desk actions call an LLM through the **Vercel AI Gateway** (`server/ai.js`), both explicit and creator-triggered — never automatic, so cost stays as predictable as the YouTube quota ledger above:
@@ -46,12 +57,18 @@ Locally, auth is OIDC via `VERCEL_OIDC_TOKEN` (already in `.env.local` from `ver
 ## Security
 
 - **Tokens are encrypted at rest.** `sessions.tokens` stores an AES-256-GCM envelope (`server/crypto.js`), not raw OAuth tokens — reading the database no longer hands out standing YouTube-posting credentials.
-- **Sessions expire.** Each session carries a 30-day `expiresAt`; `sessionFor()` rejects and deletes expired rows rather than treating a session id as a permanent bearer token.
-- Losing or rotating `SESSION_ENCRYPTION_KEY` invalidates every existing session (creators just reconnect).
+- **Sessions expire, and slide.** Each session carries a 30-day `expiresAt`; `sessionFor()` rejects and deletes expired rows rather than treating a session id as a permanent bearer token, and slides the expiry forward (at most one write per day) while a creator keeps using the app.
+- **The OAuth `state` parameter is signed, not stored** (`server/oauthState.js`). It used to live in an in-memory `Set`, which meant the instance that minted a state and the instance that verified it had to be the same process - false on any serverless/multi-instance deployment, and false again after a restart mid-login. It is now an HMAC-signed `<nonce>.<expiry>.<sig>` token with a 10-minute TTL, verifiable by any instance and stored nowhere.
+- **Refreshed OAuth tokens are written back** to `sessions.tokens`, re-encrypted, so an expired access token costs one refresh per hour rather than one per request.
+- Losing or rotating `SESSION_ENCRYPTION_KEY` invalidates every existing session (creators just reconnect). The same secret keys the OAuth state HMAC, so rotating it also invalidates any login in flight.
 
 ## Multi-tenancy and quota
 
 All creators currently authenticate through one shared Google Cloud OAuth app, which means they share one YouTube Data API quota pool (10,000 units/day by default). `server/quota.js` tracks daily usage per creator and as a `__global__` aggregate in the `quota_usage` table, and every YouTube API call site (listing videos, fetching comments, posting replies) charges against it. `DAILY_QUOTA_BUDGET` caps the shared pool below Google's real limit (leaving headroom); `PER_CREATOR_DAILY_QUOTA` caps any single creator's share, so one large channel's sync can't starve everyone else's.
+
+The ledger buckets usage by **Pacific Time** day, matching when Google's own quota resets - bucketing by UTC put the accounting 7-8 hours out of step, so the app could believe it had budget hours after Google's pool was actually spent.
+
+Every YouTube call site is gated, including the expensive one: `comments.insert` costs 50 units apiece (versus 1 for a read), and `POST /api/replies` now both checks the budget before sending and caps a single batch at 25 comments. Previously it recorded usage without ever checking it, so one oversized request could drain the shared daily pool for every creator.
 
 If a sync job runs into either cap, it pauses (`status: 'paused_quota'`) instead of failing, and picks back up automatically once the day's usage resets.
 
@@ -60,8 +77,10 @@ If a sync job runs into either cap, it pauses (`status: 'paused_quota'`) instead
 `POST /api/videos/sync` used to walk every video on a channel in one blocking request — fine for a handful of videos, but guaranteed to hit a serverless function timeout on a channel with hundreds. It's now a resumable job (`sync_jobs` table, driven by `server/sync.js`):
 
 - Each call advances the job for up to ~20 seconds — enough for a small/medium channel to finish in the one click that triggered it.
-- A large channel naturally stops partway through; the frontend polls `GET /api/videos/sync/status` and automatically re-triggers the next chunk while a job is `running`.
-- **Vercel Cron** hits `GET /api/internal/sync/tick` every minute (see `vercel.ts`), authenticated with `CRON_SECRET`, so large-channel syncs keep draining even if nobody has the app open.
+- A large channel naturally stops partway through; the frontend polls `GET /api/videos/sync/status` and automatically re-triggers the next chunk while a job is `running`. A job that hit the quota cap is polled rather than re-triggered until something resumes it, so the progress bar recovers on its own instead of freezing until a manual click.
+- **Vercel Cron** hits `GET /api/internal/sync/tick` every minute (see `vercel.ts`), authenticated with `CRON_SECRET`, so large-channel syncs keep draining even if nobody has the app open. (Minute-level crons need a Pro plan; on Hobby, drop the schedule to daily.)
+- **Jobs are claimed before they are advanced.** The creator's own sync click and the every-minute cron tick can fire at the same moment; without a claim, both workers read the same cursor, made the same YouTube calls (double-charging quota), and the slower write moved `index` *backwards*. `sync_jobs.locked_until` is compare-and-swapped forward by a single conditional `UPDATE`, so exactly one worker proceeds and the other backs off.
+- **The cursor holds only video ids.** Phase 1 writes the channel's videos to the `videos` table straight away and keeps just `{ videoIds, index }` in the job - it used to carry every video's full record and rewrite that whole JSONB blob on each 10-video chunk. The creator also sees their video list as soon as the listing phase lands, instead of waiting for the entire sync to finish.
 - `GET /api/videos` still serves the cached, already-ranked list — cheap and quota-free, safe to call on every workspace load.
 
 ## How comments are grouped
@@ -101,8 +120,11 @@ This started as a foundational-hardening pass on top of an early prototype; the 
 
 Still open, deferred to a follow-up:
 
-- **No rate limiting** on any endpoint, and **no CSRF protection** beyond the OAuth `state` check (which itself is in-memory, so it won't survive multiple server instances or a restart mid-login).
-- **Per-creator quota isolation is a shared pool, not hard isolation** — see [Multi-tenancy and quota](#multi-tenancy-and-quota). A creator who needs guaranteed throughput would need their own Google Cloud OAuth app (not yet supported).
-- **Video priority scoring doesn't weight custom categories** — `server/priority.js`'s `BUCKET_WEIGHTS` is still hardcoded to the 4 default category ids (`install`/`env`/`other`/`praise`); a creator who renames or adds categories gets weight `0` for anything outside that set until this is wired to each category's own `priority` field.
+- **No rate limiting** on any endpoint. The quota ledger bounds YouTube API spend, but nothing bounds request volume itself.
+- **AI spend is unmetered.** `server/quota.js` covers YouTube quota; there is no equivalent ledger for the AI Gateway, so "Reclassify with AI" and "AI DRAFT" can be clicked without bound.
+- **Per-creator quota isolation is a shared pool, not hard isolation** - see [Multi-tenancy and quota](#multi-tenancy-and-quota). A creator who needs guaranteed throughput would need their own Google Cloud OAuth app (not yet supported).
+- **The session id travels in a URL query parameter** on the OAuth redirect (`/?session=...`) before being moved into `sessionStorage`. It is scrubbed from the address bar, but not from browser history or any intermediate log. An httpOnly cookie would be the right shape.
+- **No transactions.** `neon-http` sends each statement as its own request, so a sync chunk that fails partway can leave videos persisted without their comments.
+- **No linter.** There is no ESLint config in the repo despite `eslint-disable` comments in the source; CI runs `build` + `test` only.
 
 None of these block the core flow (sync → group → draft → send), but they're worth knowing about before relying on this for real day-to-day use across many creators.
