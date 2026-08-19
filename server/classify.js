@@ -62,7 +62,7 @@ export function buildClassifier(categories) {
 // answer-pack clusters, one per category, dropping empty ones. Shared by
 // the live ad-hoc lookup (GET /api/comments) and the stored-video read path
 // (GET /api/videos/:id) in server/index.js.
-export function clusterByCategory(categories, comments, draftByPack = new Map()) {
+export function clusterByCategory(categories, comments, draftByPack = new Map(), contextByPack = new Map()) {
   return categories.map((category) => {
     const packComments = comments.filter((comment) => comment.packId === category.packId)
     return {
@@ -74,6 +74,7 @@ export function clusterByCategory(categories, comments, draftByPack = new Map())
       count: packComments.length,
       comments: packComments,
       draft: draftByPack.get(category.packId) || '',
+      context: contextByPack.get(category.packId) || '',
     }
   }).filter((cluster) => cluster.comments.length)
 }

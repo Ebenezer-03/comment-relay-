@@ -1,4 +1,4 @@
-import { pgTable, text, integer, timestamp, boolean, jsonb, primaryKey } from 'drizzle-orm/pg-core'
+import { pgTable, text, integer, timestamp, boolean, jsonb, primaryKey, index } from 'drizzle-orm/pg-core'
 import { sql } from 'drizzle-orm'
 
 // One row per creator who has connected their Google/YouTube account.
@@ -20,7 +20,7 @@ export const sessions = pgTable('sessions', {
   createdAt: timestamp('created_at').defaultNow().notNull(),
   // Sliding 30-day expiry; sessionFor() rejects and deletes rows past this.
   expiresAt: timestamp('expires_at').notNull().default(sql`now() + interval '30 days'`),
-})
+}, (table) => [index('sessions_creator_id_idx').on(table.creatorId)])
 
 // A video belonging to a creator's channel, refreshed on-demand.
 export const videos = pgTable('videos', {
@@ -33,7 +33,7 @@ export const videos = pgTable('videos', {
   priorityScore: integer('priority_score').default(0).notNull(),
   commentCount: integer('comment_count').default(0).notNull(),
   topPackId: text('top_pack_id'), // the answer-pack category driving priority, e.g. 'install'
-})
+}, (table) => [index('videos_creator_id_idx').on(table.creatorId)])
 
 // Comments pulled from a video's synced threads.
 export const comments = pgTable('comments', {
@@ -46,13 +46,17 @@ export const comments = pgTable('comments', {
   likeCount: integer('like_count').default(0).notNull(),
   publishedAt: timestamp('published_at'),
   packId: text('pack_id').notNull(), // matches a categories.pack_id for this comment's creator
-})
+}, (table) => [index('comments_video_id_idx').on(table.videoId)])
 
 // One answer pack per (video, category) combination, holding the current draft.
 export const answerPacks = pgTable('answer_packs', {
   videoId: text('video_id').notNull().references(() => videos.id, { onDelete: 'cascade' }),
   packId: text('pack_id').notNull(), // matches a categories.pack_id for this video's creator
   draft: text('draft').default('').notNull(),
+  // Freeform notes (known fixes, creator voice, video-specific details) used
+  // to ground both the human writing a reply and AI draft generation. Was
+  // previously local-only React state that reset on reload (main.jsx).
+  context: text('context').default('').notNull(),
 }, (table) => [primaryKey({ columns: [table.videoId, table.packId] })])
 
 // A record of replies actually sent, so "Sent replies" has real history.
@@ -64,7 +68,7 @@ export const sentReplies = pgTable('sent_replies', {
   text: text('text').notNull(),
   ok: boolean('ok').notNull(),
   sentAt: timestamp('sent_at').defaultNow().notNull(),
-})
+}, (table) => [index('sent_replies_creator_id_idx').on(table.creatorId)])
 
 // Per-creator, editable classification categories — replaces the old hardcoded
 // PACK_DEFINITIONS/classify() keyword lists. Seeded with 4 defaults (matching
@@ -108,4 +112,4 @@ export const syncJobs = pgTable('sync_jobs', {
   error: text('error'),
   startedAt: timestamp('started_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
-})
+}, (table) => [index('sync_jobs_creator_id_status_idx').on(table.creatorId, table.status)])

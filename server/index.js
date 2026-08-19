@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import express from 'express'
 import { google } from 'googleapis'
+import { APICallError } from 'ai'
 import { eq, and, gt, desc, sql } from 'drizzle-orm'
 import { getDb, schema } from './db/index.js'
 import { normalizeThreads } from './youtube.js'
@@ -8,6 +9,9 @@ import { encryptJSON, decryptJSON } from './crypto.js'
 import { getCategories, buildClassifier, seedDefaultCategories, clusterByCategory } from './classify.js'
 import { runSyncBurst, tickSyncJob, listActiveJobs } from './sync.js'
 import { recordUsage, UNIT_COSTS } from './quota.js'
+import { parsePagination } from './pagination.js'
+import { classifyCommentsWithAI, generateDraftWithAI } from './ai.js'
+import { computePriorityScore } from './priority.js'
 
 const app = express()
 const port = Number(process.env.PORT || 8787)
@@ -68,6 +72,24 @@ async function sessionFor(req) {
   return { tokens: decryptJSON(row.tokens), creatorId: row.creatorId }
 }
 
+// Express middleware wrapping sessionFor() — factored out so the ~15
+// authenticated routes below don't each repeat
+// `const session = await sessionFor(req); if (!session) return res.status(401)...`.
+// Attaches the resolved session to req.session; keeps each route's own
+// helpful 401 copy via the message argument.
+function requireSession(message) {
+  return async (req, res, next) => {
+    try {
+      const session = await sessionFor(req)
+      if (!session) return res.status(401).json({ error: message })
+      req.session = session
+      next()
+    } catch (error) {
+      next(error)
+    }
+  }
+}
+
 // Looks up a creator's most recent non-expired session, for the cron-driven
 // sync tick (which has no browser session header of its own to read).
 async function latestSessionTokensForCreator(db, creatorId) {
@@ -75,6 +97,19 @@ async function latestSessionTokensForCreator(db, creatorId) {
     .where(and(eq(schema.sessions.creatorId, creatorId), gt(schema.sessions.expiresAt, new Date())))
     .orderBy(desc(schema.sessions.createdAt)).limit(1)
   return row ? decryptJSON(row.tokens) : null
+}
+
+// Maps AI Gateway errors (server/ai.js) to a status/message pair per the
+// gateway's documented codes — 402 budget exceeded, 429 rate limited —
+// otherwise treats it as a generic upstream failure.
+function aiErrorStatus(error) {
+  if (APICallError.isInstance(error) && (error.statusCode === 402 || error.statusCode === 429)) return error.statusCode
+  return 502
+}
+function aiErrorMessage(error) {
+  if (APICallError.isInstance(error) && error.statusCode === 402) return 'AI Gateway budget limit reached. Try again later.'
+  if (APICallError.isInstance(error) && error.statusCode === 429) return 'Too many AI requests right now. Try again in a moment.'
+  return error.message || 'AI request failed.'
 }
 
 // Strips a sync job down to what the frontend needs (drops the cursor,
@@ -86,7 +121,15 @@ function publicJob(job) {
 
 app.get('/api/auth/status', async (req, res) => {
   const session = await sessionFor(req)
-  res.json({ configured: hasGoogleConfig, connected: Boolean(session) })
+  if (!session) return res.json({ configured: hasGoogleConfig, connected: false })
+  const [creator] = await getDb().select().from(schema.creators).where(eq(schema.creators.id, session.creatorId)).limit(1)
+  res.json({
+    configured: hasGoogleConfig,
+    connected: true,
+    // Real signed-in identity for the sidebar/avatar — previously hardcoded
+    // to "Alex Kim" in the frontend regardless of who was actually connected.
+    creator: creator ? { channelTitle: creator.channelTitle, email: creator.email } : null,
+  })
 })
 
 app.get('/api/auth/google', (req, res) => {
@@ -145,11 +188,10 @@ app.post('/api/auth/disconnect', async (req, res) => {
 // Ad-hoc, one-off lookup for a video URL/ID outside the synced workspace
 // (doesn't touch videos/comments storage). Classifies against the creator's
 // configurable categories, same as the stored-video path below.
-app.get('/api/comments', async (req, res) => {
+app.get('/api/comments', requireSession('Connect a Google account before syncing live comments.'), async (req, res) => {
   const videoId = videoIdFromUrl(req.query.videoId)
   if (!videoId) return res.status(400).json({ error: 'Provide a valid YouTube URL or 11-character video ID.' })
-  const session = await sessionFor(req)
-  if (!session) return res.status(401).json({ error: 'Connect a Google account before syncing live comments.' })
+  const session = req.session
   try {
     const db = getDb()
     const categories = await getCategories(db, session.creatorId)
@@ -164,10 +206,9 @@ app.get('/api/comments', async (req, res) => {
   }
 })
 
-app.post('/api/replies', async (req, res) => {
+app.post('/api/replies', requireSession('Connect a Google account before sending replies.'), async (req, res) => {
   const { videoId, parentIds, text } = req.body || {}
-  const session = await sessionFor(req)
-  if (!session) return res.status(401).json({ error: 'Connect a Google account before sending replies.' })
+  const session = req.session
   if (!videoId || !Array.isArray(parentIds) || !parentIds.length || !text?.trim()) {
     return res.status(400).json({ error: 'Provide a videoId, at least one selected comment, and reply text.' })
   }
@@ -207,21 +248,24 @@ app.post('/api/replies', async (req, res) => {
 // Serves the creator's videos from the cache built by /api/videos/sync,
 // ranked by priority. Cheap and quota-free — call this on every workspace
 // load; call sync explicitly (button/refresh) to pull fresh data.
-app.get('/api/videos', async (req, res) => {
-  const session = await sessionFor(req)
-  if (!session) return res.status(401).json({ error: 'Connect a Google account before listing videos.' })
+app.get('/api/videos', requireSession('Connect a Google account before listing videos.'), async (req, res) => {
+  const session = req.session
   const db = getDb()
-  const rows = await db.select().from(schema.videos).where(eq(schema.videos.creatorId, session.creatorId)).orderBy(desc(schema.videos.priorityScore))
-  res.json({ videos: rows })
+  const { limit, offset } = parsePagination(req.query)
+  const [rows, [{ count }]] = await Promise.all([
+    db.select().from(schema.videos).where(eq(schema.videos.creatorId, session.creatorId))
+      .orderBy(desc(schema.videos.priorityScore)).limit(limit).offset(offset),
+    db.select({ count: sql`count(*)::int` }).from(schema.videos).where(eq(schema.videos.creatorId, session.creatorId)),
+  ])
+  res.json({ videos: rows, total: count, limit, offset })
 })
 
 // Advances (or starts) the creator's resumable sync job for up to ~20s —
 // enough for small/medium channels to finish in this one request. Large
 // channels stop partway through and continue on the next click or via the
 // cron-driven tick below. See server/sync.js for the chunking/quota logic.
-app.post('/api/videos/sync', async (req, res) => {
-  const session = await sessionFor(req)
-  if (!session) return res.status(401).json({ error: 'Connect a Google account before syncing videos.' })
+app.post('/api/videos/sync', requireSession('Connect a Google account before syncing videos.'), async (req, res) => {
+  const session = req.session
   try {
     const client = oauthClient()
     client.setCredentials(session.tokens)
@@ -237,9 +281,8 @@ app.post('/api/videos/sync', async (req, res) => {
 })
 
 // Lets the frontend poll sync progress without re-triggering a burst.
-app.get('/api/videos/sync/status', async (req, res) => {
-  const session = await sessionFor(req)
-  if (!session) return res.status(401).json({ error: 'Connect a Google account before checking sync status.' })
+app.get('/api/videos/sync/status', requireSession('Connect a Google account before checking sync status.'), async (req, res) => {
+  const session = req.session
   const db = getDb()
   const [job] = await db.select().from(schema.syncJobs)
     .where(eq(schema.syncJobs.creatorId, session.creatorId))
@@ -280,9 +323,8 @@ app.get('/api/internal/sync/tick', async (req, res) => {
 // Loads one video's cached, classified comments + persisted drafts — no
 // live YouTube call. This is what the reply desk reads when a creator
 // clicks into a video from their workspace list.
-app.get('/api/videos/:id', async (req, res) => {
-  const session = await sessionFor(req)
-  if (!session) return res.status(401).json({ error: 'Connect a Google account before opening a video.' })
+app.get('/api/videos/:id', requireSession('Connect a Google account before opening a video.'), async (req, res) => {
+  const session = req.session
   const db = getDb()
   const [video] = await db.select().from(schema.videos).where(eq(schema.videos.id, req.params.id)).limit(1)
   if (!video || video.creatorId !== session.creatorId) return res.status(404).json({ error: 'Video not found.' })
@@ -293,6 +335,7 @@ app.get('/api/videos/:id', async (req, res) => {
     getCategories(db, session.creatorId),
   ])
   const draftByPack = new Map(packRows.map((row) => [row.packId, row.draft]))
+  const contextByPack = new Map(packRows.map((row) => [row.packId, row.context]))
   const comments = commentRows.map((row) => ({
     id: row.id,
     parentId: row.parentId,
@@ -303,36 +346,150 @@ app.get('/api/videos/:id', async (req, res) => {
     time: row.publishedAt ? new Date(row.publishedAt).toLocaleDateString() : 'recently',
     packId: row.packId,
   }))
-  res.json({ video, clusters: clusterByCategory(categories, comments, draftByPack) })
+  res.json({ video, clusters: clusterByCategory(categories, comments, draftByPack, contextByPack) })
 })
 
-// Persists an edited draft for one video's answer pack.
-app.put('/api/videos/:id/packs/:packId', async (req, res) => {
-  const session = await sessionFor(req)
-  if (!session) return res.status(401).json({ error: 'Connect a Google account before editing a draft.' })
-  const { draft } = req.body || {}
-  if (typeof draft !== 'string') return res.status(400).json({ error: 'draft must be a string.' })
+// Persists an edited draft and/or context note for one video's answer pack.
+app.put('/api/videos/:id/packs/:packId', requireSession('Connect a Google account before editing a draft.'), async (req, res) => {
+  const session = req.session
+  const { draft, context } = req.body || {}
+  if (draft !== undefined && typeof draft !== 'string') return res.status(400).json({ error: 'draft must be a string.' })
+  if (context !== undefined && typeof context !== 'string') return res.status(400).json({ error: 'context must be a string.' })
+  if (draft === undefined && context === undefined) return res.status(400).json({ error: 'Provide draft and/or context.' })
 
   const db = getDb()
   const [video] = await db.select().from(schema.videos).where(eq(schema.videos.id, req.params.id)).limit(1)
   if (!video || video.creatorId !== session.creatorId) return res.status(404).json({ error: 'Video not found.' })
 
-  await db.insert(schema.answerPacks).values({ videoId: req.params.id, packId: req.params.packId, draft })
-    .onConflictDoUpdate({ target: [schema.answerPacks.videoId, schema.answerPacks.packId], set: { draft: sql`excluded.draft` } })
+  const values = { videoId: req.params.id, packId: req.params.packId }
+  const set = {}
+  if (draft !== undefined) { values.draft = draft; set.draft = sql`excluded.draft` }
+  if (context !== undefined) { values.context = context; set.context = sql`excluded.context` }
+  await db.insert(schema.answerPacks).values(values)
+    .onConflictDoUpdate({ target: [schema.answerPacks.videoId, schema.answerPacks.packId], set })
   res.json({ ok: true })
+})
+
+// Re-buckets a video's already-synced comments with an LLM (server/ai.js)
+// instead of the plain keyword classifier — an explicit, creator-triggered
+// upgrade for niches the default keyword rules don't fit well. Recomputes
+// topPackId/priorityScore the same way server/sync.js does after a sync.
+app.post('/api/videos/:id/reclassify', requireSession('Connect a Google account before reclassifying comments.'), async (req, res) => {
+  const session = req.session
+  const db = getDb()
+  const [video] = await db.select().from(schema.videos).where(eq(schema.videos.id, req.params.id)).limit(1)
+  if (!video || video.creatorId !== session.creatorId) return res.status(404).json({ error: 'Video not found.' })
+
+  const [commentRows, categories] = await Promise.all([
+    db.select().from(schema.comments).where(eq(schema.comments.videoId, video.id)),
+    getCategories(db, session.creatorId),
+  ])
+  if (!commentRows.length) return res.status(400).json({ error: 'This video has no synced comments to reclassify.' })
+
+  try {
+    const packIds = await classifyCommentsWithAI(commentRows.map((row) => ({ id: row.id, text: row.text })), categories)
+    await Promise.all(
+      commentRows
+        .filter((row) => packIds.has(row.id) && packIds.get(row.id) !== row.packId)
+        .map((row) => db.update(schema.comments).set({ packId: packIds.get(row.id) }).where(eq(schema.comments.id, row.id)))
+    )
+
+    const bucketCounts = {}
+    for (const row of commentRows) {
+      const packId = packIds.get(row.id) || row.packId
+      bucketCounts[packId] = (bucketCounts[packId] || 0) + 1
+    }
+    const topPackId = Object.entries(bucketCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || video.topPackId
+    const priorityScore = computePriorityScore(bucketCounts, video.publishedAt)
+    await db.update(schema.videos).set({ topPackId, priorityScore }).where(eq(schema.videos.id, video.id))
+
+    const [packRows] = await Promise.all([db.select().from(schema.answerPacks).where(eq(schema.answerPacks.videoId, video.id))])
+    const draftByPack = new Map(packRows.map((row) => [row.packId, row.draft]))
+    const contextByPack = new Map(packRows.map((row) => [row.packId, row.context]))
+    const comments = commentRows.map((row) => ({
+      id: row.id,
+      parentId: row.parentId,
+      name: row.authorName,
+      initials: row.authorInitials,
+      text: row.text,
+      likes: row.likeCount,
+      time: row.publishedAt ? new Date(row.publishedAt).toLocaleDateString() : 'recently',
+      packId: packIds.get(row.id) || row.packId,
+    }))
+    res.json({ clusters: clusterByCategory(categories, comments, draftByPack, contextByPack) })
+  } catch (error) {
+    res.status(aiErrorStatus(error)).json({ error: aiErrorMessage(error) })
+  }
+})
+
+// Generates a draft reply for one answer pack via the AI Gateway (server/ai.js),
+// grounded in a sample of the pack's comments plus any saved context, and
+// saves it — same as if the creator had typed it and blurred the textarea.
+// Makes the composer's "AI DRAFT" badge describe something real.
+app.post('/api/videos/:id/packs/:packId/draft/generate', requireSession('Connect a Google account before generating a draft.'), async (req, res) => {
+  const session = req.session
+  const db = getDb()
+  const [video] = await db.select().from(schema.videos).where(eq(schema.videos.id, req.params.id)).limit(1)
+  if (!video || video.creatorId !== session.creatorId) return res.status(404).json({ error: 'Video not found.' })
+
+  const [categories, commentRows, [pack]] = await Promise.all([
+    getCategories(db, session.creatorId),
+    db.select().from(schema.comments).where(and(eq(schema.comments.videoId, video.id), eq(schema.comments.packId, req.params.packId))),
+    db.select().from(schema.answerPacks).where(and(eq(schema.answerPacks.videoId, video.id), eq(schema.answerPacks.packId, req.params.packId))),
+  ])
+  const category = categories.find((item) => item.packId === req.params.packId)
+  if (!category) return res.status(404).json({ error: 'Category not found.' })
+  if (!commentRows.length) return res.status(400).json({ error: 'This pack has no comments to draft a reply for.' })
+
+  try {
+    const draft = await generateDraftWithAI({
+      videoTitle: video.title,
+      categoryLabel: category.label,
+      context: pack?.context || '',
+      comments: commentRows,
+    })
+    await db.insert(schema.answerPacks).values({ videoId: video.id, packId: req.params.packId, draft })
+      .onConflictDoUpdate({ target: [schema.answerPacks.videoId, schema.answerPacks.packId], set: { draft: sql`excluded.draft` } })
+    res.json({ draft })
+  } catch (error) {
+    res.status(aiErrorStatus(error)).json({ error: aiErrorMessage(error) })
+  }
 })
 
 // Categories drive comment classification (server/classify.js) and are
 // per-creator so word lists tuned for one niche don't leak into another's.
-app.get('/api/categories', async (req, res) => {
-  const session = await sessionFor(req)
-  if (!session) return res.status(401).json({ error: 'Connect a Google account before viewing categories.' })
-  res.json({ categories: await getCategories(getDb(), session.creatorId) })
+app.get('/api/categories', requireSession('Connect a Google account before viewing categories.'), async (req, res) => {
+  res.json({ categories: await getCategories(getDb(), req.session.creatorId) })
 })
 
-app.post('/api/categories', async (req, res) => {
-  const session = await sessionFor(req)
-  if (!session) return res.status(401).json({ error: 'Connect a Google account before adding a category.' })
+// Sent-reply history — server/index.js's POST /api/replies has always
+// written here (schema.sentReplies), but until now nothing read it back;
+// this is what the previously-inert "Sent replies" nav item now calls.
+app.get('/api/sent-replies', requireSession('Connect a Google account before viewing sent replies.'), async (req, res) => {
+  const session = req.session
+  const db = getDb()
+  const { limit, offset } = parsePagination(req.query)
+  const [rows, [{ count }]] = await Promise.all([
+    db.select({
+      id: schema.sentReplies.id,
+      videoId: schema.sentReplies.videoId,
+      parentIds: schema.sentReplies.parentIds,
+      text: schema.sentReplies.text,
+      ok: schema.sentReplies.ok,
+      sentAt: schema.sentReplies.sentAt,
+      videoTitle: schema.videos.title,
+      videoThumbnailUrl: schema.videos.thumbnailUrl,
+    }).from(schema.sentReplies)
+      .leftJoin(schema.videos, eq(schema.sentReplies.videoId, schema.videos.id))
+      .where(eq(schema.sentReplies.creatorId, session.creatorId))
+      .orderBy(desc(schema.sentReplies.sentAt)).limit(limit).offset(offset),
+    db.select({ count: sql`count(*)::int` }).from(schema.sentReplies).where(eq(schema.sentReplies.creatorId, session.creatorId)),
+  ])
+  res.json({ replies: rows, total: count, limit, offset })
+})
+
+app.post('/api/categories', requireSession('Connect a Google account before adding a category.'), async (req, res) => {
+  const session = req.session
   const { packId, label, priority, tone, summary, keywords } = req.body || {}
   if (!packId || !/^[a-z0-9-]+$/.test(packId)) return res.status(400).json({ error: 'packId must be lowercase letters, numbers, and hyphens.' })
   if (!label?.trim()) return res.status(400).json({ error: 'label is required.' })
@@ -357,9 +514,8 @@ app.post('/api/categories', async (req, res) => {
   res.status(201).json({ categories: await getCategories(db, session.creatorId) })
 })
 
-app.put('/api/categories/:packId', async (req, res) => {
-  const session = await sessionFor(req)
-  if (!session) return res.status(401).json({ error: 'Connect a Google account before editing a category.' })
+app.put('/api/categories/:packId', requireSession('Connect a Google account before editing a category.'), async (req, res) => {
+  const session = req.session
   const { label, priority, tone, summary, keywords, sortOrder } = req.body || {}
   const set = {}
   if (typeof label === 'string' && label.trim()) set.label = label.trim()
@@ -378,9 +534,8 @@ app.put('/api/categories/:packId', async (req, res) => {
   res.json({ categories: await getCategories(db, session.creatorId) })
 })
 
-app.delete('/api/categories/:packId', async (req, res) => {
-  const session = await sessionFor(req)
-  if (!session) return res.status(401).json({ error: 'Connect a Google account before deleting a category.' })
+app.delete('/api/categories/:packId', requireSession('Connect a Google account before deleting a category.'), async (req, res) => {
+  const session = req.session
   const db = getDb()
   const existing = await getCategories(db, session.creatorId)
   const target = existing.find((category) => category.packId === req.params.packId)
@@ -390,6 +545,17 @@ app.delete('/api/categories/:packId', async (req, res) => {
 
   await db.delete(schema.categories).where(and(eq(schema.categories.creatorId, session.creatorId), eq(schema.categories.packId, req.params.packId)))
   res.json({ categories: await getCategories(db, session.creatorId) })
+})
+
+app.use((req, res) => res.status(404).json({ error: 'Not found.' }))
+
+// Catches anything a route didn't handle in its own try/catch (Express 5
+// forwards async rejections here automatically) so a bug returns the same
+// JSON error shape as everything else instead of Express's default HTML page.
+// eslint-disable-next-line no-unused-vars
+app.use((error, req, res, next) => {
+  console.error('[error]', error)
+  res.status(500).json({ error: 'Internal server error.' })
 })
 
 app.listen(port, () => console.log(`Comment Relay API listening on http://localhost:${port}`))

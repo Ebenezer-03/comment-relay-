@@ -84,4 +84,15 @@ describe('clusterByCategory', () => {
     const [cluster] = clusterByCategory(categories, comments, drafts)
     expect(cluster.draft).toBe('Try Node 18+')
   })
+
+  it('carries a per-pack context note from contextByPack, defaulting to empty', () => {
+    const comments = [
+      { id: 1, packId: 'install', text: 'npm fails' },
+      { id: 2, packId: 'other', text: 'random' },
+    ]
+    const contexts = new Map([['install', 'Node 18+ required']])
+    const clusters = clusterByCategory(categories, comments, new Map(), contexts)
+    expect(clusters.find((cluster) => cluster.id === 'install').context).toBe('Node 18+ required')
+    expect(clusters.find((cluster) => cluster.id === 'other').context).toBe('')
+  })
 })

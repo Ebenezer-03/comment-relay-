@@ -8,6 +8,13 @@
       "when": 1786379397466,
       "tag": "0000_baseline",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1786409828129,
+      "tag": "0001_closed_justice",
+      "breakpoints": true
     }
   ]
 }
