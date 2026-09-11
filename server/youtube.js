@@ -70,6 +70,7 @@ export async function fetchRecentCommentThreads(youtube, videoId, maxResults = 1
 export function normalizeThreads(items) {
   return items.map((item, index) => {
     const snippet = item.snippet?.topLevelComment?.snippet || {}
+    const replyCount = Number(item.snippet?.totalReplyCount || 0)
     return {
       id: item.id || `youtube-${index}`,
       parentId: item.snippet?.topLevelComment?.id || item.id,
@@ -79,6 +80,8 @@ export function normalizeThreads(items) {
       publishedAt: snippet.publishedAt || null,
       text: snippet.textOriginal || snippet.textDisplay || '',
       likes: snippet.likeCount || 0,
+      replyCount,
+      isReplied: replyCount > 0,
     }
   })
 }

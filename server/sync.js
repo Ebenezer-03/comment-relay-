@@ -97,6 +97,8 @@ async function persistRows(db, videoRows, commentRows, answerPackRows) {
         likeCount: sql`excluded.like_count`,
         publishedAt: sql`excluded.published_at`,
         packId: sql`excluded.pack_id`,
+        replyCount: sql`excluded.reply_count`,
+        isReplied: sql`comments.is_replied OR excluded.is_replied`,
       },
     })
   }
@@ -195,7 +197,11 @@ export async function advanceSyncJob(db, job, youtube, classify, weights) {
       const threads = video.commentCount > 0 ? await fetchRecentCommentThreads(youtube, video.id) : []
       const comments = normalizeThreads(threads).map((comment) => ({ ...comment, packId: classify(comment.text) }))
       const bucketCounts = {}
-      for (const comment of comments) bucketCounts[comment.packId] = (bucketCounts[comment.packId] || 0) + 1
+      for (const comment of comments) {
+        if (!comment.isReplied) {
+          bucketCounts[comment.packId] = (bucketCounts[comment.packId] || 0) + 1
+        }
+      }
       const [topPackId, topCount] = Object.entries(bucketCounts).sort((a, b) => b[1] - a[1])[0] || [null, 0]
       const publishedAt = video.publishedAt ? new Date(video.publishedAt) : null
 
@@ -222,6 +228,8 @@ export async function advanceSyncJob(db, job, youtube, classify, weights) {
           likeCount: comment.likes,
           publishedAt: comment.publishedAt ? new Date(comment.publishedAt) : null,
           packId: comment.packId,
+          replyCount: comment.replyCount || 0,
+          isReplied: Boolean(comment.isReplied),
         })
       }
       for (const packId of new Set(comments.map((comment) => comment.packId))) {

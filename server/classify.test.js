@@ -95,4 +95,16 @@ describe('clusterByCategory', () => {
     expect(clusters.find((cluster) => cluster.id === 'install').context).toBe('Node 18+ required')
     expect(clusters.find((cluster) => cluster.id === 'other').context).toBe('')
   })
+
+  it('counts only unanswered comments in cluster.count while tracking totalCount', () => {
+    const comments = [
+      { id: 1, packId: 'install', text: 'npm fails', isReplied: true },
+      { id: 2, packId: 'install', text: 'still broken', isReplied: false },
+      { id: 3, packId: 'install', text: 'another error' },
+    ]
+    const [cluster] = clusterByCategory(categories, comments)
+    expect(cluster.count).toBe(2)
+    expect(cluster.totalCount).toBe(3)
+    expect(cluster.comments).toHaveLength(3)
+  })
 })

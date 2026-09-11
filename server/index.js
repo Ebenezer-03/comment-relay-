@@ -2,7 +2,7 @@ import crypto from 'node:crypto'
 import express from 'express'
 import { google } from 'googleapis'
 import { APICallError } from 'ai'
-import { eq, and, gt, desc, sql, inArray } from 'drizzle-orm'
+import { eq, and, or, gt, desc, sql, inArray } from 'drizzle-orm'
 import { getDb, schema } from './db/index.js'
 import { normalizeThreads } from './youtube.js'
 import { encryptJSON, decryptJSON } from './crypto.js'
@@ -308,6 +308,22 @@ app.post('/api/replies', requireSession('Connect a Google account before sending
       text: text.trim(),
       ok: results.every((result) => result.ok),
     })
+
+    // Mark the answered comments as replied in the comments table so they
+    // no longer linger on the dashboard as unanswered threads.
+    const successfulParentIds = results.filter((result) => result.ok).map((result) => result.parentId)
+    if (successfulParentIds.length) {
+      await db.update(schema.comments)
+        .set({
+          isReplied: true,
+          repliedAt: new Date(),
+          replyCount: sql`${schema.comments.replyCount} + 1`,
+        })
+        .where(or(
+          inArray(schema.comments.id, successfulParentIds),
+          inArray(schema.comments.parentId, successfulParentIds),
+        ))
+    }
     res.json({ results })
   } catch (error) {
     res.status(502).json({ error: error.message || 'Reply submission failed.' })
@@ -407,11 +423,14 @@ app.get('/api/videos/:id', requireSession('Connect a Google account before openi
   const [video] = await db.select().from(schema.videos).where(eq(schema.videos.id, req.params.id)).limit(1)
   if (!video || video.creatorId !== session.creatorId) return res.status(404).json({ error: 'Video not found.' })
 
-  const [commentRows, packRows, categories] = await Promise.all([
+  const [commentRows, packRows, categories, sentRows] = await Promise.all([
     db.select().from(schema.comments).where(eq(schema.comments.videoId, video.id)),
     db.select().from(schema.answerPacks).where(eq(schema.answerPacks.videoId, video.id)),
     getCategories(db, session.creatorId),
+    db.select({ parentIds: schema.sentReplies.parentIds }).from(schema.sentReplies)
+      .where(and(eq(schema.sentReplies.videoId, video.id), eq(schema.sentReplies.ok, true))),
   ])
+  const sentParentIds = new Set(sentRows.flatMap((r) => Array.isArray(r.parentIds) ? r.parentIds : []))
   const draftByPack = new Map(packRows.map((row) => [row.packId, row.draft]))
   const contextByPack = new Map(packRows.map((row) => [row.packId, row.context]))
   const comments = commentRows.map((row) => ({
@@ -423,6 +442,9 @@ app.get('/api/videos/:id', requireSession('Connect a Google account before openi
     likes: row.likeCount,
     time: row.publishedAt ? new Date(row.publishedAt).toLocaleDateString() : 'recently',
     packId: row.packId,
+    isReplied: Boolean(row.isReplied) || sentParentIds.has(row.id) || sentParentIds.has(row.parentId),
+    repliedAt: row.repliedAt,
+    replyCount: row.replyCount || 0,
   }))
   res.json({ video, clusters: clusterByCategory(categories, comments, draftByPack, contextByPack) })
 })

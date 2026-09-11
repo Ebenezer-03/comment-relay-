@@ -46,6 +46,9 @@ export const comments = pgTable('comments', {
   likeCount: integer('like_count').default(0).notNull(),
   publishedAt: timestamp('published_at'),
   packId: text('pack_id').notNull(), // matches a categories.pack_id for this comment's creator
+  isReplied: boolean('is_replied').default(false).notNull(),
+  repliedAt: timestamp('replied_at'),
+  replyCount: integer('reply_count').default(0).notNull(),
 }, (table) => [index('comments_video_id_idx').on(table.videoId)])
 
 // One answer pack per (video, category) combination, holding the current draft.

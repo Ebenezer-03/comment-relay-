@@ -37,6 +37,7 @@ export function AppStateProvider({ children }) {
   const [activeId, setActiveId] = useState('install')
   const [selected, setSelected] = useState([1, 2])
   const [sent, setSent] = useState(false)
+  const [lastSentCount, setLastSentCount] = useState(0)
   const [sendError, setSendError] = useState('')
   const [reclassifying, setReclassifying] = useState(false)
   const [draftGenerating, setDraftGenerating] = useState(false)
@@ -276,6 +277,8 @@ export function AppStateProvider({ children }) {
     if (!selectedCount || sending) return
     setSending(true)
     setSendError('')
+    const idsToReply = [...selected]
+    const countSending = idsToReply.length
     if (liveSession && activeVideo) {
       try {
         const data = await apiFetch('/api/replies', {
@@ -291,13 +294,33 @@ export function AppStateProvider({ children }) {
         return
       }
     }
+
+    setLastSentCount(countSending)
+    // Immediately update clusters so answered comments transition out of the
+    // unanswered queue and reflect their answered state without needing a reload.
+    setClusters((prevClusters) => prevClusters.map((cluster) => {
+      const updatedComments = cluster.comments.map((comment) => {
+        if (idsToReply.includes(comment.id) || idsToReply.includes(comment.parentId)) {
+          return { ...comment, isReplied: true, repliedAt: new Date().toISOString() }
+        }
+        return comment
+      })
+      const unanswered = updatedComments.filter((comment) => !comment.isReplied).length
+      return {
+        ...cluster,
+        count: unanswered,
+        comments: updatedComments,
+      }
+    }))
+    setSelected([])
     setSent(true)
     setSending(false)
   }
 
   function selectAllActiveComments() {
     if (!active) return
-    setSelected(active.comments.map((comment) => comment.id))
+    const unanswered = active.comments.filter((comment) => !comment.isReplied)
+    setSelected(unanswered.length ? unanswered.map((comment) => comment.id) : active.comments.map((comment) => comment.id))
     setSent(false)
   }
 
@@ -402,7 +425,7 @@ export function AppStateProvider({ children }) {
     workspaceVideos, videosTotal, videosOffset, videosLimit, workspaceLoading, workspaceSyncing, workspaceError, syncJob,
     loadWorkspaceVideos, syncWorkspaceVideos, refreshSyncStatus,
     categories, categoriesOpen, setCategoriesOpen, categoriesLoading, categoriesError, saveCategory, addCategory, deleteCategory,
-    activeVideo, videoLoading, clusters, active, activeId, setActiveId, selected, setSelected, sent, sendError, sending,
+    activeVideo, videoLoading, clusters, active, activeId, setActiveId, selected, setSelected, sent, lastSentCount, sendError, sending,
     openVideo, backToWorkspace, toggleComment, selectAllActiveComments, clearSelection, changeDraft, saveDraft, changeContext, saveContext, sendReplies,
     selectedCount, totalQuestions, selectedComments,
     reclassifyWithAI, reclassifying, generateDraft, draftGenerating, aiError,

@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { AlertTriangle, ArrowLeft, Bot, Check, CheckCheck, ExternalLink, Send, Sparkles, Video } from 'lucide-react'
 import { useAppState } from '../context/AppState.jsx'
@@ -15,11 +15,20 @@ export default function ReplyDesk() {
   const navigate = useNavigate()
   const {
     liveSession, creator, workspaceVideos, videosTotal, videoLoading, activeVideo, clusters, active, activeId, setActiveId,
-    selected, setSelected, sent, sendError, sending, openVideo, backToWorkspace, toggleComment, selectAllActiveComments, clearSelection, changeDraft, saveDraft,
+    selected, setSelected, sent, lastSentCount, sendError, sending, openVideo, backToWorkspace, toggleComment, selectAllActiveComments, clearSelection, changeDraft, saveDraft,
     changeContext, saveContext, sendReplies, selectedCount, totalQuestions, reclassifyWithAI, reclassifying,
     generateDraft, draftGenerating, aiError,
     escalations, agentTriageRunning, agentReport, runStrandsAgentTriage, resolveEscalation, setAccountOpen,
   } = useAppState()
+
+  const [filterMode, setFilterMode] = useState('all')
+  const unansweredComments = active?.comments.filter((c) => !c.isReplied) || []
+  const repliedComments = active?.comments.filter((c) => c.isReplied) || []
+  const displayedComments = (active?.comments || []).filter((c) => {
+    if (filterMode === 'unanswered') return !c.isReplied
+    if (filterMode === 'replied') return c.isReplied
+    return true
+  })
 
   // Deep link: open the requested video if it isn't already open.
   useEffect(() => {
@@ -154,27 +163,63 @@ export default function ReplyDesk() {
                 <h2>{active.label}</h2>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <button
-                  className="tiny-button"
-                  onClick={selectedCount === active.comments.length ? clearSelection : selectAllActiveComments}
-                  title={selectedCount === active.comments.length ? 'Deselect all comments' : 'Select all comments in this pack'}
-                >
-                  <CheckCheck size={13} />
-                  {selectedCount === active.comments.length ? 'Deselect all' : `Select all (${active.comments.length})`}
-                </button>
-                <span className={`pill ${active.tone}`}>{active.count} similar comments</span>
+                {unansweredComments.length > 0 ? (
+                  <button
+                    className="tiny-button"
+                    onClick={selectedCount === unansweredComments.length ? clearSelection : selectAllActiveComments}
+                    title={selectedCount === unansweredComments.length ? 'Deselect all comments' : 'Select all unanswered comments in this pack'}
+                  >
+                    <CheckCheck size={13} />
+                    {selectedCount === unansweredComments.length ? 'Deselect all' : `Select unanswered (${unansweredComments.length})`}
+                  </button>
+                ) : (
+                  <span className="pill green" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                    <Check size={12} /> All answered
+                  </span>
+                )}
+                <span className={`pill ${active.count > 0 ? active.tone : 'green'}`}>
+                  {active.count === 0 ? '0 pending' : `${active.count} pending`}
+                </span>
               </div>
             </div>
             <div className="rationale"><Sparkles size={15} /><span><strong>Why these are together</strong>{active.summary} The wording and intent match closely enough for one tailored answer.</span></div>
+
+            <div className="thread-filter-bar">
+              <button
+                type="button"
+                className={`filter-chip ${filterMode === 'all' ? 'active' : ''}`}
+                onClick={() => setFilterMode('all')}
+              >
+                All ({active.comments.length})
+              </button>
+              <button
+                type="button"
+                className={`filter-chip ${filterMode === 'unanswered' ? 'active' : ''}`}
+                onClick={() => setFilterMode('unanswered')}
+              >
+                Unanswered ({unansweredComments.length})
+              </button>
+              {repliedComments.length > 0 && (
+                <button
+                  type="button"
+                  className={`filter-chip ${filterMode === 'replied' ? 'active' : ''}`}
+                  onClick={() => setFilterMode('replied')}
+                >
+                  Answered ({repliedComments.length})
+                </button>
+              )}
+            </div>
+
             <div className="thread-list">
-              {active.comments.map((comment) => (
-                <article className={`comment ${selected.includes(comment.id) ? 'comment-selected' : ''}`} key={comment.id}>
+              {displayedComments.map((comment) => (
+                <article className={`comment ${comment.isReplied ? 'comment-replied' : ''} ${selected.includes(comment.id) ? 'comment-selected' : ''}`} key={comment.id}>
                   <button
                     className={`checkbox ${selected.includes(comment.id) ? 'checked' : ''}`}
                     onClick={() => toggleComment(comment.id)}
                     role="checkbox"
                     aria-checked={selected.includes(comment.id)}
                     aria-label={`Select comment by ${comment.name}`}
+                    title={comment.isReplied ? 'Already replied to' : 'Select comment'}
                   >
                     {selected.includes(comment.id) && <Check size={14} />}
                   </button>
@@ -182,6 +227,11 @@ export default function ReplyDesk() {
                   <div className="comment-body">
                     <div className="comment-meta">
                       <strong>{comment.name}</strong>
+                      {comment.isReplied && (
+                        <span className="pill green" style={{ fontSize: 10, padding: '1px 6px', display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                          <Check size={10} /> Replied
+                        </span>
+                      )}
                       <span>{comment.time}</span>
                       <span className="comment-video">on this video</span>
                     </div>
@@ -201,6 +251,20 @@ export default function ReplyDesk() {
                   </div>
                 </article>
               ))}
+              {displayedComments.length === 0 && (
+                <div style={{ padding: '32px 16px', textAlign: 'center', color: 'var(--fg-muted)', fontSize: 13 }}>
+                  {filterMode === 'unanswered' ? (
+                    <>
+                      <div style={{ fontSize: 22, marginBottom: 6 }}>🎉</div>
+                      <strong>All caught up!</strong>
+                      <p style={{ margin: '4px 0 10px', fontSize: 12, color: 'var(--fg-subtle)' }}>Every comment in this pack has received a reply.</p>
+                      <button className="tiny-button" onClick={() => setFilterMode('all')}>View all comments</button>
+                    </>
+                  ) : (
+                    <span>No comments in this view.</span>
+                  )}
+                </div>
+              )}
             </div>
           </section>
 
@@ -242,7 +306,7 @@ export default function ReplyDesk() {
                 )}
               </button>
             </div>
-            {sent && <div className="success-note" role="status"><Check size={15} /> {selectedCount} reply results recorded. Nothing else was sent.</div>}
+            {sent && <div className="success-note" role="status"><Check size={15} /> {lastSentCount || 1} repl{(lastSentCount || 1) === 1 ? 'y' : 'ies'} sent to YouTube! Marked as answered.</div>}
             {sendError && <div className="error-note" role="alert">{sendError}</div>}
             {aiError && <div className="error-note" role="alert">{aiError}</div>}
             <div className="consent-note">You always choose what gets sent. Comment Relay never auto-replies.</div>

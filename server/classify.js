@@ -65,13 +65,15 @@ export function buildClassifier(categories) {
 export function clusterByCategory(categories, comments, draftByPack = new Map(), contextByPack = new Map()) {
   return categories.map((category) => {
     const packComments = comments.filter((comment) => comment.packId === category.packId)
+    const unanswered = packComments.filter((comment) => !comment.isReplied)
     return {
       id: category.packId,
       label: category.label,
       priority: category.priority,
       tone: category.tone,
       summary: category.summary,
-      count: packComments.length,
+      count: unanswered.length,
+      totalCount: packComments.length,
       comments: packComments,
       draft: draftByPack.get(category.packId) || '',
       context: contextByPack.get(category.packId) || '',
