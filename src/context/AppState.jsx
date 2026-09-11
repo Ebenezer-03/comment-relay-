@@ -45,6 +45,9 @@ export function AppStateProvider({ children }) {
   const [escalationsLoading, setEscalationsLoading] = useState(false)
   const [agentTriageRunning, setAgentTriageRunning] = useState(false)
   const [agentReport, setAgentReport] = useState(null)
+  const [sending, setSending] = useState(false)
+  const [helpOpen, setHelpOpen] = useState(false)
+  const [accountOpen, setAccountOpen] = useState(false)
 
   // Clear selections whenever the active cluster changes to avoid phantom selections
   useEffect(() => {
@@ -270,7 +273,8 @@ export function AppStateProvider({ children }) {
   }
 
   async function sendReplies() {
-    if (!selectedCount) return
+    if (!selectedCount || sending) return
+    setSending(true)
     setSendError('')
     if (liveSession && activeVideo) {
       try {
@@ -283,10 +287,33 @@ export function AppStateProvider({ children }) {
         if (failures.length) throw new Error(`${failures.length} selected repl${failures.length === 1 ? 'y' : 'ies'} failed to send.`)
       } catch (error) {
         setSendError(error.message)
+        setSending(false)
         return
       }
     }
     setSent(true)
+    setSending(false)
+  }
+
+  function selectAllActiveComments() {
+    if (!active) return
+    setSelected(active.comments.map((comment) => comment.id))
+    setSent(false)
+  }
+
+  function clearSelection() {
+    setSelected([])
+    setSent(false)
+  }
+
+  function disconnect() {
+    sessionStorage.removeItem('comment-relay-session')
+    setLiveSession('')
+    setCreator(null)
+    setActiveVideo(null)
+    setClusters(demoClusters)
+    setActiveId('install')
+    setAccountOpen(false)
   }
 
   // Re-buckets the open video's comments with the AI Gateway instead of the
@@ -375,11 +402,12 @@ export function AppStateProvider({ children }) {
     workspaceVideos, videosTotal, videosOffset, videosLimit, workspaceLoading, workspaceSyncing, workspaceError, syncJob,
     loadWorkspaceVideos, syncWorkspaceVideos, refreshSyncStatus,
     categories, categoriesOpen, setCategoriesOpen, categoriesLoading, categoriesError, saveCategory, addCategory, deleteCategory,
-    activeVideo, videoLoading, clusters, active, activeId, setActiveId, selected, setSelected, sent, sendError,
-    openVideo, backToWorkspace, toggleComment, changeDraft, saveDraft, changeContext, saveContext, sendReplies,
+    activeVideo, videoLoading, clusters, active, activeId, setActiveId, selected, setSelected, sent, sendError, sending,
+    openVideo, backToWorkspace, toggleComment, selectAllActiveComments, clearSelection, changeDraft, saveDraft, changeContext, saveContext, sendReplies,
     selectedCount, totalQuestions, selectedComments,
     reclassifyWithAI, reclassifying, generateDraft, draftGenerating, aiError,
     escalations, escalationsLoading, agentTriageRunning, agentReport, runStrandsAgentTriage, loadEscalations, resolveEscalation,
+    helpOpen, setHelpOpen, accountOpen, setAccountOpen, disconnect,
   }
 
   return <AppStateContext.Provider value={value}>{children}</AppStateContext.Provider>

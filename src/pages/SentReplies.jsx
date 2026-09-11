@@ -11,7 +11,7 @@ const LIMIT = 20
 // written to sentReplies, but until now nothing read it back and this nav
 // item ("Sent replies") was inert. Backed by GET /api/sent-replies.
 export default function SentReplies() {
-  const { liveSession, creator } = useAppState()
+  const { liveSession, creator, setAccountOpen } = useAppState()
   const [replies, setReplies] = useState([])
   const [total, setTotal] = useState(0)
   const [offset, setOffset] = useState(0)
@@ -45,7 +45,7 @@ export default function SentReplies() {
     <>
       <header className="topbar">
         <div><div className="eyebrow">WORKSPACE / HISTORY</div><h1>Every reply<br /><em>you've actually sent.</em></h1></div>
-        <div className="top-actions"><button className="avatar avatar-purple">{initials}</button></div>
+        <div className="top-actions"><button className="avatar avatar-purple" onClick={() => setAccountOpen(true)} title="View account details">{initials}</button></div>
       </header>
 
       {!liveSession ? (

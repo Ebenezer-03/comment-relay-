@@ -15,7 +15,7 @@ export default function ConnectedVideos() {
   const {
     liveSession, creator, workspaceVideos, videosTotal, videosOffset, videosLimit, loadWorkspaceVideos,
     workspaceLoading, workspaceSyncing, workspaceError, syncWorkspaceVideos, videoLoading, syncJob,
-    categories, setCategoriesOpen,
+    categories, setCategoriesOpen, setAccountOpen,
   } = useAppState()
 
   const displayName = liveSession && creator ? (creator.channelTitle || creator.email || 'Connected creator') : DEMO_NAME
@@ -51,7 +51,7 @@ export default function ConnectedVideos() {
         <div className="top-actions">
           <button className="secondary-button" onClick={() => setCategoriesOpen(true)}><Sparkles size={15} />Edit categories</button>
           <button className="secondary-button" onClick={syncWorkspaceVideos} disabled={workspaceSyncing}><RefreshCw size={15} className={workspaceSyncing ? 'spin' : ''} />{workspaceSyncing ? 'Syncing…' : 'Sync videos'}</button>
-          <button className="avatar avatar-purple">{initials}</button>
+          <button className="avatar avatar-purple" onClick={() => setAccountOpen(true)} title="View account details">{initials}</button>
         </div>
       </header>
       <SyncProgress job={syncJob} />

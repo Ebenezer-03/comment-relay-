@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { AlertTriangle, ArrowLeft, Bot, Check, ExternalLink, Send, Sparkles, Video } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, Bot, Check, CheckCheck, ExternalLink, Send, Sparkles, Video } from 'lucide-react'
 import { useAppState } from '../context/AppState.jsx'
 import { formatRelative, avatarTone, initialsFor } from '../utils/format.js'
 
@@ -15,10 +15,10 @@ export default function ReplyDesk() {
   const navigate = useNavigate()
   const {
     liveSession, creator, workspaceVideos, videosTotal, videoLoading, activeVideo, clusters, active, activeId, setActiveId,
-    selected, setSelected, sent, sendError, openVideo, backToWorkspace, toggleComment, changeDraft, saveDraft,
+    selected, setSelected, sent, sendError, sending, openVideo, backToWorkspace, toggleComment, selectAllActiveComments, clearSelection, changeDraft, saveDraft,
     changeContext, saveContext, sendReplies, selectedCount, totalQuestions, reclassifyWithAI, reclassifying,
     generateDraft, draftGenerating, aiError,
-    escalations, agentTriageRunning, agentReport, runStrandsAgentTriage, resolveEscalation,
+    escalations, agentTriageRunning, agentReport, runStrandsAgentTriage, resolveEscalation, setAccountOpen,
   } = useAppState()
 
   // Deep link: open the requested video if it isn't already open.
@@ -80,7 +80,7 @@ export default function ReplyDesk() {
             </button>
           )}
           {liveSession ? <span className="connected-badge"><span className="live-dot" /> Google connected</span> : <a className="connect-button" href={`${import.meta.env.VITE_API_BASE || 'http://localhost:8787'}/api/auth/google`}>Connect Google</a>}
-          <button className="avatar avatar-purple">{initials}</button>
+          <button className="avatar avatar-purple" onClick={() => setAccountOpen(true)} title="View account details">{initials}</button>
         </div>
       </header>
 
@@ -148,9 +148,60 @@ export default function ReplyDesk() {
           </section>
 
           <section className="thread-panel">
-            <div className="panel-head"><div><div className="eyebrow">PACK / {active.priority.toUpperCase()} PRIORITY</div><h2>{active.label}</h2></div><span className={`pill ${active.tone}`}>{active.count} similar comments</span></div>
+            <div className="panel-head">
+              <div>
+                <div className="eyebrow">PACK / {active.priority.toUpperCase()} PRIORITY</div>
+                <h2>{active.label}</h2>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <button
+                  className="tiny-button"
+                  onClick={selectedCount === active.comments.length ? clearSelection : selectAllActiveComments}
+                  title={selectedCount === active.comments.length ? 'Deselect all comments' : 'Select all comments in this pack'}
+                >
+                  <CheckCheck size={13} />
+                  {selectedCount === active.comments.length ? 'Deselect all' : `Select all (${active.comments.length})`}
+                </button>
+                <span className={`pill ${active.tone}`}>{active.count} similar comments</span>
+              </div>
+            </div>
             <div className="rationale"><Sparkles size={15} /><span><strong>Why these are together</strong>{active.summary} The wording and intent match closely enough for one tailored answer.</span></div>
-            <div className="thread-list">{active.comments.map((comment) => <article className={`comment ${selected.includes(comment.id) ? 'comment-selected' : ''}`} key={comment.id}><button className={`checkbox ${selected.includes(comment.id) ? 'checked' : ''}`} onClick={() => toggleComment(comment.id)} role="checkbox" aria-checked={selected.includes(comment.id)} aria-label={`Select comment by ${comment.name}`}>{selected.includes(comment.id) && <Check size={14} />}</button><div className={`avatar avatar-${avatarTone(comment.id)}`}>{comment.initials}</div><div className="comment-body"><div className="comment-meta"><strong>{comment.name}</strong><span>{comment.time}</span><span className="comment-video">on this video</span></div><p>{comment.text}</p><div className="comment-actions"><span>♡ {comment.likes}</span><button>Open on YouTube <ExternalLink size={11} /></button></div></div></article>)}</div>
+            <div className="thread-list">
+              {active.comments.map((comment) => (
+                <article className={`comment ${selected.includes(comment.id) ? 'comment-selected' : ''}`} key={comment.id}>
+                  <button
+                    className={`checkbox ${selected.includes(comment.id) ? 'checked' : ''}`}
+                    onClick={() => toggleComment(comment.id)}
+                    role="checkbox"
+                    aria-checked={selected.includes(comment.id)}
+                    aria-label={`Select comment by ${comment.name}`}
+                  >
+                    {selected.includes(comment.id) && <Check size={14} />}
+                  </button>
+                  <div className={`avatar avatar-${avatarTone(comment.id)}`}>{comment.initials}</div>
+                  <div className="comment-body">
+                    <div className="comment-meta">
+                      <strong>{comment.name}</strong>
+                      <span>{comment.time}</span>
+                      <span className="comment-video">on this video</span>
+                    </div>
+                    <p>{comment.text}</p>
+                    <div className="comment-actions">
+                      <span>♡ {comment.likes}</span>
+                      <a
+                        href={activeVideo ? `https://www.youtube.com/watch?v=${activeVideo.id}&lc=${comment.id}` : 'https://www.youtube.com'}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{ display: 'inline-flex', alignItems: 'center', gap: 4, textDecoration: 'none', color: 'inherit' }}
+                        title="Open comment on YouTube in a new tab"
+                      >
+                        Open on YouTube <ExternalLink size={11} />
+                      </a>
+                    </div>
+                  </div>
+                </article>
+              ))}
+            </div>
           </section>
 
           <section className="composer-panel">
@@ -161,15 +212,35 @@ export default function ReplyDesk() {
                 : <span className="draft-badge"><Sparkles size={13} /> AI DRAFT</span>}
             </div>
             <label className="field-label">Replying to <span>{selectedCount} selected {selectedCount === 1 ? 'comment' : 'comments'}</span></label>
-            <textarea value={active.draft} onChange={(event) => changeDraft(event.target.value)} onBlur={saveDraft} />
+            <textarea value={active.draft} onChange={(event) => changeDraft(event.target.value)} onBlur={saveDraft} disabled={sending} />
             <div className="context-section">
               <div className="field-label">CONTEXT USED</div>
               <div className="context-chips"><span>Known fix</span><span>Creator voice</span><span>Video details</span></div>
               <textarea className="context-input" value={active.context || ''} onChange={(event) => changeContext(event.target.value)} onBlur={saveContext} placeholder="Known fixes, your voice, video-specific details…" />
             </div>
             <div className="composer-footer">
-              <span className="character-count">{active.draft.length} / 800</span>
-              <button className="send-button" disabled={!selectedCount || sent} onClick={sendReplies}>{sent ? <><Check size={16} />Replies sent</> : <><Send size={16} />Reply selected <span>{selectedCount}</span></>}</button>
+              <span
+                className="character-count"
+                style={{
+                  color: active.draft.length > 800 ? 'var(--danger-text)' : active.draft.length > 700 ? 'var(--warning-accent)' : undefined,
+                  fontWeight: active.draft.length > 700 ? 600 : undefined,
+                }}
+              >
+                {active.draft.length} / 800
+              </span>
+              <button
+                className="send-button"
+                disabled={!selectedCount || sent || sending || active.draft.length > 800}
+                onClick={sendReplies}
+              >
+                {sending ? (
+                  <><Send size={16} className="spin" /> Sending to {selectedCount}…</>
+                ) : sent ? (
+                  <><Check size={16} />Replies sent</>
+                ) : (
+                  <><Send size={16} />Reply selected <span>{selectedCount}</span></>
+                )}
+              </button>
             </div>
             {sent && <div className="success-note" role="status"><Check size={15} /> {selectedCount} reply results recorded. Nothing else was sent.</div>}
             {sendError && <div className="error-note" role="alert">{sendError}</div>}
