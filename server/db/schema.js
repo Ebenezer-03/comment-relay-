@@ -120,3 +120,20 @@ export const syncJobs = pgTable('sync_jobs', {
   startedAt: timestamp('started_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 }, (table) => [index('sync_jobs_creator_id_status_idx').on(table.creatorId, table.status)])
+
+// Decisions surfaced by the autonomous Strands agent for creator judgment.
+// Holds high-urgency questions, novel bug reports, or ambiguity that only
+// a human decision should resolve.
+export const escalations = pgTable('escalations', {
+  id: text('id').primaryKey(),
+  videoId: text('video_id').notNull().references(() => videos.id, { onDelete: 'cascade' }),
+  creatorId: text('creator_id').notNull().references(() => creators.id, { onDelete: 'cascade' }),
+  commentId: text('comment_id').notNull(),
+  authorName: text('author_name'),
+  commentText: text('comment_text').notNull(),
+  urgencyReason: text('urgency_reason').notNull(),
+  recommendedAction: text('recommended_action').notNull(),
+  status: text('status').default('pending').notNull(), // 'pending' | 'resolved' | 'dismissed'
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+}, (table) => [index('escalations_video_id_idx').on(table.videoId)])
+

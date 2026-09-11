@@ -13,6 +13,7 @@ import { checkBudget, recordUsage, UNIT_COSTS } from './quota.js'
 import { parsePagination } from './pagination.js'
 import { classifyCommentsWithAI, generateDraftWithAI } from './ai.js'
 import { computePriorityScore, weightsFromCategories } from './priority.js'
+import { runCommunityTriageAgent } from './agent.js'
 
 const app = express()
 const port = Number(process.env.PORT || 8787)
@@ -541,6 +542,47 @@ app.post('/api/videos/:id/packs/:packId/draft/generate', requireSession('Connect
   } catch (error) {
     res.status(aiErrorStatus(error)).json({ error: aiErrorMessage(error) })
   }
+})
+
+// Autonomous Community Triage Agent (powered by AWS Strands Agents SDK & Amazon Bedrock)
+// Runs autonomously in the background, handles repetitive questions into packs,
+// and surfaces ONLY novel bugs, partnership requests, or high-judgment items as escalations.
+app.post('/api/videos/:id/agent/triage', requireSession('Connect a Google account before running the Strands agent.'), async (req, res) => {
+  const session = req.session
+  const db = getDb()
+  try {
+    const report = await runCommunityTriageAgent({
+      db,
+      creatorId: session.creatorId,
+      videoId: req.params.id,
+    })
+    res.json({ ok: true, report })
+  } catch (error) {
+    console.error('[agent] Community triage failed:', error)
+    res.status(500).json({ error: error.message || 'Strands Agent triage failed.' })
+  }
+})
+
+// Gets surfaced decisions / escalations requiring creator human judgment
+app.get('/api/videos/:id/agent/escalations', requireSession('Connect a Google account before viewing escalations.'), async (req, res) => {
+  const session = req.session
+  const db = getDb()
+  const rows = await db.select().from(schema.escalations)
+    .where(and(eq(schema.escalations.creatorId, session.creatorId), eq(schema.escalations.videoId, req.params.id), eq(schema.escalations.status, 'pending')))
+    .orderBy(desc(schema.escalations.createdAt))
+  res.json({ escalations: rows })
+})
+
+// Resolves a creator decision
+app.post('/api/escalations/:id/resolve', requireSession('Connect a Google account before resolving an escalation.'), async (req, res) => {
+  const session = req.session
+  const db = getDb()
+  const updated = await db.update(schema.escalations)
+    .set({ status: 'resolved' })
+    .where(and(eq(schema.escalations.id, req.params.id), eq(schema.escalations.creatorId, session.creatorId)))
+    .returning()
+  if (!updated.length) return res.status(404).json({ error: 'Escalation not found.' })
+  res.json({ ok: true, escalation: updated[0] })
 })
 
 // Categories drive comment classification (server/classify.js) and are

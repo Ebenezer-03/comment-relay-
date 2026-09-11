@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { ArrowLeft, Check, ExternalLink, Send, Sparkles, Video } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, Bot, Check, ExternalLink, Send, Sparkles, Video } from 'lucide-react'
 import { useAppState } from '../context/AppState.jsx'
 import { formatRelative, avatarTone, initialsFor } from '../utils/format.js'
 
@@ -18,6 +18,7 @@ export default function ReplyDesk() {
     selected, setSelected, sent, sendError, openVideo, backToWorkspace, toggleComment, changeDraft, saveDraft,
     changeContext, saveContext, sendReplies, selectedCount, totalQuestions, reclassifyWithAI, reclassifying,
     generateDraft, draftGenerating, aiError,
+    escalations, agentTriageRunning, agentReport, runStrandsAgentTriage, resolveEscalation,
   } = useAppState()
 
   // Deep link: open the requested video if it isn't already open.
@@ -66,6 +67,18 @@ export default function ReplyDesk() {
           <h1>Answer the questions<br /><em>that keep coming up.</em></h1>
         </div>
         <div className="top-actions">
+          {liveSession && activeVideo && (
+            <button
+              className="secondary-button"
+              onClick={runStrandsAgentTriage}
+              disabled={agentTriageRunning}
+              title="Run autonomous community triage with Strands Agents SDK on Amazon Bedrock"
+              style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+            >
+              <Bot size={15} />
+              {agentTriageRunning ? 'Agent Triaging…' : 'Run Strands Agent'}
+            </button>
+          )}
           {liveSession ? <span className="connected-badge"><span className="live-dot" /> Google connected</span> : <a className="connect-button" href={`${import.meta.env.VITE_API_BASE || 'http://localhost:8787'}/api/auth/google`}>Connect Google</a>}
           <button className="avatar avatar-purple">{initials}</button>
         </div>
@@ -80,6 +93,37 @@ export default function ReplyDesk() {
           <div className="video-stats"><span><strong>{totalQuestions}</strong> questions grouped</span><span><strong>{clusters.length}</strong> answer packs ready</span></div>
         </div>
       </section>
+
+      {escalations.length > 0 && (
+        <div style={{ background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 8, padding: '14px 18px', margin: '14px 0 18px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 600, color: '#92400e', marginBottom: 10 }}>
+            <AlertTriangle size={18} color="#d97706" />
+            <span>Strands Agent Surfaced {escalations.length} Decision{escalations.length === 1 ? '' : 's'} Requiring Your Human Judgment</span>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {escalations.map((item) => (
+              <div key={item.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fff', padding: '10px 14px', borderRadius: 6, border: '1px solid #fef3c7' }}>
+                <div style={{ fontSize: 13, color: '#1f2937' }}>
+                  <strong>{item.authorName || 'Commenter'}:</strong> "{item.commentText.slice(0, 120)}{item.commentText.length > 120 ? '…' : ''}"
+                  <div style={{ fontSize: 11, color: '#b45309', marginTop: 3 }}>
+                    <strong>Urgency Reason:</strong> {item.urgencyReason} · <em>Recommended: {item.recommendedAction}</em>
+                  </div>
+                </div>
+                <button className="secondary-button" style={{ fontSize: 12, padding: '4px 10px', marginLeft: 12, flexShrink: 0 }} onClick={() => resolveEscalation(item.id)}>
+                  <Check size={12} /> Resolve
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {agentReport && (
+        <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: '10px 16px', margin: '0 0 16px', fontSize: 13, color: '#166534', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Sparkles size={16} color="#16a34a" />
+          <span><strong>Strands Agent Report:</strong> Triaged {agentReport.triagedCount} comments into answer packs · {agentReport.escalatedCount} human decisions surfaced · {agentReport.draftsUpdated} drafts generated.</span>
+        </div>
+      )}
 
       {videoLoading ? <p className="pack-intro">Loading…</p> : !active ? (
         <div className="rationale" style={{ maxWidth: 480 }}><Sparkles size={15} /><span><strong>No comments to group yet</strong>This video hasn't picked up any comments matching the answer-pack categories. Try again after it gets more engagement.</span></div>

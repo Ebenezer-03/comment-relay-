@@ -41,6 +41,10 @@ export function AppStateProvider({ children }) {
   const [reclassifying, setReclassifying] = useState(false)
   const [draftGenerating, setDraftGenerating] = useState(false)
   const [aiError, setAiError] = useState('')
+  const [escalations, setEscalations] = useState([])
+  const [escalationsLoading, setEscalationsLoading] = useState(false)
+  const [agentTriageRunning, setAgentTriageRunning] = useState(false)
+  const [agentReport, setAgentReport] = useState(null)
 
   // Clear selections whenever the active cluster changes to avoid phantom selections
   useEffect(() => {
@@ -219,6 +223,7 @@ export function AppStateProvider({ children }) {
       setSelected([])
       setSent(false)
       setSendError('')
+      await loadEscalations(videoId)
     } catch (error) {
       setWorkspaceError(error.message)
     }
@@ -319,6 +324,44 @@ export function AppStateProvider({ children }) {
     setDraftGenerating(false)
   }
 
+  const loadEscalations = useCallback(async (videoId) => {
+    if (!liveSession || !videoId) return
+    setEscalationsLoading(true)
+    try {
+      const data = await apiFetch(`/api/videos/${videoId}/agent/escalations`, { session: liveSession })
+      setEscalations(data.escalations || [])
+    } catch {
+      // Non-fatal
+    }
+    setEscalationsLoading(false)
+  }, [liveSession])
+
+  async function runStrandsAgentTriage() {
+    if (!liveSession || !activeVideo) return
+    setAgentTriageRunning(true)
+    setAiError('')
+    try {
+      const data = await apiFetch(`/api/videos/${activeVideo.id}/agent/triage`, { method: 'POST', session: liveSession })
+      setAgentReport(data.report)
+      const vidData = await apiFetch(`/api/videos/${activeVideo.id}`, { session: liveSession })
+      setClusters(vidData.clusters)
+      await loadEscalations(activeVideo.id)
+    } catch (error) {
+      setAiError(error.message)
+    }
+    setAgentTriageRunning(false)
+  }
+
+  async function resolveEscalation(id) {
+    if (!liveSession) return
+    try {
+      await apiFetch(`/api/escalations/${id}/resolve`, { method: 'POST', session: liveSession })
+      setEscalations((curr) => curr.filter((item) => item.id !== id))
+    } catch (error) {
+      setAiError(error.message)
+    }
+  }
+
   const selectedCount = active ? active.comments.filter((comment) => selected.includes(comment.id)).length : 0
   // "Questions" = everything that isn't low-priority chatter. Keyed off the
   // category's own priority rather than the literal pack id 'praise', which
@@ -336,6 +379,7 @@ export function AppStateProvider({ children }) {
     openVideo, backToWorkspace, toggleComment, changeDraft, saveDraft, changeContext, saveContext, sendReplies,
     selectedCount, totalQuestions, selectedComments,
     reclassifyWithAI, reclassifying, generateDraft, draftGenerating, aiError,
+    escalations, escalationsLoading, agentTriageRunning, agentReport, runStrandsAgentTriage, loadEscalations, resolveEscalation,
   }
 
   return <AppStateContext.Provider value={value}>{children}</AppStateContext.Provider>

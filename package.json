@@ -15,7 +15,9 @@
     "db:studio": "dotenv -e .env.local -- drizzle-kit studio"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@neondatabase/serverless": "^1.1.0",
+    "@strands-agents/sdk": "^1.17.0",
     "@vitejs/plugin-react": "^6.0.5",
     "ai": "^6.0.247",
     "drizzle-orm": "^0.45.2",
@@ -26,7 +28,7 @@
     "react-dom": "^19.2.8",
     "react-router-dom": "^7.18.2",
     "vite": "^8.2.1",
-    "zod": "^3.25.76"
+    "zod": "^4.6.2"
   },
   "devDependencies": {
     "@vercel/config": "^0.5.6",
