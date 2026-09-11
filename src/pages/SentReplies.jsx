@@ -51,9 +51,12 @@ export default function SentReplies() {
       {!liveSession ? (
         <div className="rationale" style={{ maxWidth: 480 }}><Sparkles size={15} /><span><strong>Connect Google to see sent replies</strong>This history is per-creator — connect your account to view what you've sent.</span></div>
       ) : error ? (
-        <div className="error-note" style={{ marginBottom: 16 }}>{error}</div>
+        <div className="error-note" role="alert" style={{ marginBottom: 16 }}>{error}</div>
       ) : loading ? (
-        <p className="pack-intro">Loading…</p>
+        <div className="skeleton-container" role="status" aria-label="Loading sent replies history">
+          <div className="skeleton-box" style={{ height: 68, width: '100%' }} />
+          <div className="skeleton-box" style={{ height: 68, width: '100%' }} />
+        </div>
       ) : replies.length === 0 ? (
         <div className="rationale" style={{ maxWidth: 480 }}><Sparkles size={15} /><span><strong>No replies sent yet</strong>Once you send replies from the reply desk, they'll show up here.</span></div>
       ) : (

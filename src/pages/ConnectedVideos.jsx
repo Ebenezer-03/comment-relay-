@@ -55,8 +55,14 @@ export default function ConnectedVideos() {
         </div>
       </header>
       <SyncProgress job={syncJob} />
-      {workspaceError && <div className="error-note" style={{ marginBottom: 16 }}>{workspaceError}</div>}
-      {workspaceLoading ? <p className="pack-intro">Loading your videos…</p> : workspaceVideos.length === 0 ? (
+      {workspaceError && <div className="error-note" role="alert" style={{ marginBottom: 16 }}>{workspaceError}</div>}
+      {workspaceLoading ? (
+        <div className="skeleton-container" role="status" aria-label="Loading your videos">
+          <div className="skeleton-box" style={{ height: 68, width: '100%' }} />
+          <div className="skeleton-box" style={{ height: 68, width: '100%' }} />
+          <div className="skeleton-box" style={{ height: 68, width: '100%' }} />
+        </div>
+      ) : workspaceVideos.length === 0 ? (
         <div className="rationale" style={{ maxWidth: 480 }}><Sparkles size={15} /><span><strong>No videos synced yet</strong>Click "Sync videos" to pull every video on your channel, ranked by how urgent the comments look.</span></div>
       ) : (
         <>

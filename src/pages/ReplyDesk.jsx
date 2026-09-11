@@ -95,37 +95,42 @@ export default function ReplyDesk() {
       </section>
 
       {escalations.length > 0 && (
-        <div style={{ background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 8, padding: '14px 18px', margin: '14px 0 18px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontWeight: 600, color: '#92400e', marginBottom: 10 }}>
-            <AlertTriangle size={18} color="#d97706" />
+        <section className="banner-escalation" role="region" aria-label="Strands Agent Escalations" aria-live="polite">
+          <div className="banner-escalation-header">
+            <AlertTriangle size={18} />
             <span>Strands Agent Surfaced {escalations.length} Decision{escalations.length === 1 ? '' : 's'} Requiring Your Human Judgment</span>
           </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <div className="banner-escalation-list">
             {escalations.map((item) => (
-              <div key={item.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fff', padding: '10px 14px', borderRadius: 6, border: '1px solid #fef3c7' }}>
-                <div style={{ fontSize: 13, color: '#1f2937' }}>
+              <div key={item.id} className="banner-escalation-item">
+                <div className="banner-escalation-text">
                   <strong>{item.authorName || 'Commenter'}:</strong> "{item.commentText.slice(0, 120)}{item.commentText.length > 120 ? '…' : ''}"
-                  <div style={{ fontSize: 11, color: '#b45309', marginTop: 3 }}>
+                  <div className="banner-escalation-reason">
                     <strong>Urgency Reason:</strong> {item.urgencyReason} · <em>Recommended: {item.recommendedAction}</em>
                   </div>
                 </div>
-                <button className="secondary-button" style={{ fontSize: 12, padding: '4px 10px', marginLeft: 12, flexShrink: 0 }} onClick={() => resolveEscalation(item.id)}>
-                  <Check size={12} /> Resolve
+                <button className="secondary-button" style={{ fontSize: 12, padding: '6px 12px', flexShrink: 0 }} onClick={() => resolveEscalation(item.id)}>
+                  <Check size={13} /> Resolve
                 </button>
               </div>
             ))}
           </div>
-        </div>
+        </section>
       )}
 
       {agentReport && (
-        <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: '10px 16px', margin: '0 0 16px', fontSize: 13, color: '#166534', display: 'flex', alignItems: 'center', gap: 8 }}>
-          <Sparkles size={16} color="#16a34a" />
+        <div className="banner-report" role="status" aria-live="polite">
+          <Sparkles size={16} />
           <span><strong>Strands Agent Report:</strong> Triaged {agentReport.triagedCount} comments into answer packs · {agentReport.escalatedCount} human decisions surfaced · {agentReport.draftsUpdated} drafts generated.</span>
         </div>
       )}
 
-      {videoLoading ? <p className="pack-intro">Loading…</p> : !active ? (
+      {videoLoading ? (
+        <div className="skeleton-container" role="status" aria-label="Loading video and answer packs">
+          <div className="skeleton-box" style={{ height: 42, width: '100%' }} />
+          <div className="skeleton-box" style={{ height: 550, width: '100%' }} />
+        </div>
+      ) : !active ? (
         <div className="rationale" style={{ maxWidth: 480 }}><Sparkles size={15} /><span><strong>No comments to group yet</strong>This video hasn't picked up any comments matching the answer-pack categories. Try again after it gets more engagement.</span></div>
       ) : (
         <div className="workbench">
@@ -145,7 +150,7 @@ export default function ReplyDesk() {
           <section className="thread-panel">
             <div className="panel-head"><div><div className="eyebrow">PACK / {active.priority.toUpperCase()} PRIORITY</div><h2>{active.label}</h2></div><span className={`pill ${active.tone}`}>{active.count} similar comments</span></div>
             <div className="rationale"><Sparkles size={15} /><span><strong>Why these are together</strong>{active.summary} The wording and intent match closely enough for one tailored answer.</span></div>
-            <div className="thread-list">{active.comments.map((comment) => <article className={`comment ${selected.includes(comment.id) ? 'comment-selected' : ''}`} key={comment.id}><button className={`checkbox ${selected.includes(comment.id) ? 'checked' : ''}`} onClick={() => toggleComment(comment.id)} aria-label={`Select ${comment.name}`}>{selected.includes(comment.id) && <Check size={13} />}</button><div className={`avatar avatar-${avatarTone(comment.id)}`}>{comment.initials}</div><div className="comment-body"><div className="comment-meta"><strong>{comment.name}</strong><span>{comment.time}</span><span className="comment-video">on this video</span></div><p>{comment.text}</p><div className="comment-actions"><span>♡ {comment.likes}</span><button>Open on YouTube <ExternalLink size={11} /></button></div></div></article>)}</div>
+            <div className="thread-list">{active.comments.map((comment) => <article className={`comment ${selected.includes(comment.id) ? 'comment-selected' : ''}`} key={comment.id}><button className={`checkbox ${selected.includes(comment.id) ? 'checked' : ''}`} onClick={() => toggleComment(comment.id)} role="checkbox" aria-checked={selected.includes(comment.id)} aria-label={`Select comment by ${comment.name}`}>{selected.includes(comment.id) && <Check size={14} />}</button><div className={`avatar avatar-${avatarTone(comment.id)}`}>{comment.initials}</div><div className="comment-body"><div className="comment-meta"><strong>{comment.name}</strong><span>{comment.time}</span><span className="comment-video">on this video</span></div><p>{comment.text}</p><div className="comment-actions"><span>♡ {comment.likes}</span><button>Open on YouTube <ExternalLink size={11} /></button></div></div></article>)}</div>
           </section>
 
           <section className="composer-panel">
@@ -166,9 +171,9 @@ export default function ReplyDesk() {
               <span className="character-count">{active.draft.length} / 800</span>
               <button className="send-button" disabled={!selectedCount || sent} onClick={sendReplies}>{sent ? <><Check size={16} />Replies sent</> : <><Send size={16} />Reply selected <span>{selectedCount}</span></>}</button>
             </div>
-            {sent && <div className="success-note"><Check size={15} /> {selectedCount} reply results recorded. Nothing else was sent.</div>}
-            {sendError && <div className="error-note">{sendError}</div>}
-            {aiError && <div className="error-note">{aiError}</div>}
+            {sent && <div className="success-note" role="status"><Check size={15} /> {selectedCount} reply results recorded. Nothing else was sent.</div>}
+            {sendError && <div className="error-note" role="alert">{sendError}</div>}
+            {aiError && <div className="error-note" role="alert">{aiError}</div>}
             <div className="consent-note">You always choose what gets sent. Comment Relay never auto-replies.</div>
           </section>
         </div>
