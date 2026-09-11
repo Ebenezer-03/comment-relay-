@@ -58,7 +58,27 @@ export async function fetchRecentCommentThreads(youtube, videoId, maxResults = 1
     })
     return response.data.items || []
   } catch (error) {
+    const isQuota = /quota/i.test(error.message || '') || error.errors?.some((e) => /quota/i.test(e.reason || ''))
+    if (isQuota) throw error
     if (error.code === 403 || error.code === 404) return [] // comments disabled or video not found
     throw error
   }
+}
+
+// Shapes a raw commentThreads.list response into the flat comment records
+// used throughout the app (classification, storage, display).
+export function normalizeThreads(items) {
+  return items.map((item, index) => {
+    const snippet = item.snippet?.topLevelComment?.snippet || {}
+    return {
+      id: item.id || `youtube-${index}`,
+      parentId: item.snippet?.topLevelComment?.id || item.id,
+      name: snippet.authorDisplayName || 'YouTube viewer',
+      initials: (snippet.authorDisplayName || 'YT').replace(/[^A-Za-z ]/g, '').split(' ').map((part) => part[0]).join('').slice(0, 2).toUpperCase(),
+      time: snippet.publishedAt ? new Date(snippet.publishedAt).toLocaleDateString() : 'recently',
+      publishedAt: snippet.publishedAt || null,
+      text: snippet.textOriginal || snippet.textDisplay || '',
+      likes: snippet.likeCount || 0,
+    }
+  })
 }
