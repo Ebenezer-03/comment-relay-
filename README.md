@@ -1,58 +1,105 @@
 # Comment Relay
 
-Comment Relay is a creator-controlled reply desk for a YouTube channel. Once connected, a creator lands on a ranked list of their videos (weighted by comment urgency and recency, using each category's own priority label), picks one, and works a reply desk that groups repeated learner questions into answer packs, drafts a response from creator context, and requires explicit selection before anything can be sent.
+> **Autonomous YouTube Community Triage & Reply Desk**  
+> *Built with the **AWS Strands Agents SDK** & **Amazon Bedrock** for the **Agents for Humans Hackathon** (Professional Agents Track)*
 
-Built for multiple creators to use independently — see [Multi-tenancy and quota](#multi-tenancy-and-quota) for how it keeps one creator's usage from affecting another's.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![AWS Strands Agents](https://img.shields.io/badge/Built%20With-Strands%20Agents%20SDK-orange.svg)](https://github.com/strands-agents/harness-sdk)
+[![Amazon Bedrock](https://img.shields.io/badge/Model%20Provider-Amazon%20Bedrock-232F3E.svg)](https://aws.amazon.com/bedrock/)
+
+---
+
+## What is Comment Relay?
+
+YouTube creators, educators, and technical makers lose hours every day to repetitive community tasks: answering the exact same installation errors, explaining environment setup, and acknowledging routine feedback.
+
+Instead of being another dashboard creators have to open and manage all day, **Comment Relay** deploys an autonomous AI agent built on the **AWS Strands Agents SDK** and powered by **Amazon Bedrock**. The agent operates continuously in the background:
+- **Handles Routine & Repetitive Tasks**: Automatically ingests incoming comments, groups repeated questions into cohesive answer packs, and prepares grounded response drafts using creator-provided notes and knowledge base context.
+- **Surfaces ONLY When There is a Real Decision to Make**: Identifies novel code bugs, tutorial regressions, sponsor inquiries, and high-risk sentiment, escalating them directly to the creator with an actionable recommendation card. The creator reviews and resolves only the decisions that truly require human judgment.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph YouTube["YouTube Platform"]
+        YT_API["YouTube Data API v3\n(commentThreads.list & comments.insert)"]
+    end
+
+    subgraph AWS_Strands["AWS Cloud & Strands Agents SDK"]
+        Bedrock["Amazon Bedrock\n(Anthropic Claude 3.5 Sonnet / Haiku)"]
+        StrandsAgent["Strands Community Triage Agent\n(@strands-agents/sdk)"]
+        
+        StrandsAgent <--> Bedrock
+
+        subgraph Tools["Strands Agent Tools"]
+            T1["lookupContext\n(Creator notes & FAQ)"]
+            T2["draftReply\n(Grounded answer packs)"]
+            T3["escalateDecision\n(Flags critical items)"]
+        end
+
+        StrandsAgent --- Tools
+    end
+
+    subgraph Storage["Neon Lakebase Postgres"]
+        DB[("PostgreSQL\n• sessions (AES-256 encrypted)\n• videos & comments\n• answer_packs\n• escalations (surfaced items)\n• quota_usage ledger")]
+    end
+
+    subgraph CreatorDesk["Creator Workspace (Human-in-the-Loop)"]
+        UI["Reply Desk UI\n(Vite + React Router 7)"]
+        Decisions["Surfaced Decisions\n(Only when judgment is needed)"]
+    end
+
+    YT_API <--> StrandsAgent
+    Tools <--> DB
+    T3 --> Decisions
+    Decisions --> UI
+    UI -->|Human Approval / Edit| YT_API
+```
+
+### Strands Agent Tools
+
+1. **`lookupContext`**: Fetches creator-curated troubleshooting notes, known fixes, and category definitions for the active video.
+2. **`draftReply`**: Generates a warm, group-oriented reply for an answer pack grounded in the comments and context notes (capped under 800 characters).
+3. **`escalateDecision`**: Surfaces comments that cannot be answered autonomously—such as reported bugs in video code, sponsorship inquiries, or conflicting instructions—creating a prioritized human review item.
+
+---
 
 ## Run locally
 
 ```bash
 npm install
-npm run db:push   # first time only — syncs schema to Neon Postgres (see "Database migrations" below)
-npm run dev
-npm run server
+npm run db:push   # syncs schema to Neon Postgres
+npm run dev       # starts Vite frontend on http://localhost:5173
+npm run server    # starts Express API on http://localhost:8787
 ```
 
-The frontend runs at `http://localhost:5173` and the API runs at `http://localhost:8787`.
+`npm run server` loads `.env` and `.env.local` automatically via Node's `--env-file-if-exists`.
 
-The frontend still falls back to seeded comments when the API is not configured. To enable live YouTube data, copy `.env.example` to `.env`, fill it in (see below for what each variable is for), create a Google OAuth web client, and add `http://localhost:8787/api/oauth2callback` as an authorized redirect URI. The backend uses `commentThreads.list` for sync and `comments.insert` only for explicitly selected replies.
-
-`npm run server` loads `.env` and `.env.local` itself (via Node's `--env-file-if-exists`) — no separate dotenv step needed.
-
-The frontend is now routed (`react-router-dom`): `/` is the reply desk (auto-opens your top-priority video, or `/reply-desk/:videoId` to deep-link a specific one), `/videos` is the full connected-videos list (paginated), and `/sent` is your sent-reply history. `src/main.jsx` just wires up the router now — the actual screens live in `src/pages/`, shared state in `src/context/AppState.jsx`, and reusable pieces in `src/components/`.
-
-Data — creators, OAuth sessions, videos, comments, answer packs, categories, sync jobs, quota usage, sent replies — is persisted in Neon Postgres (provisioned via the Vercel Marketplace; `DATABASE_URL` and friends live in `.env.local`, pulled with `vercel env pull`). A creator's identity is their YouTube channel, so signing in with Google links replies and history to that channel rather than a per-server session that resets on restart.
-
-The API logs every request (method, path, status code, duration) to the console — useful for following the sync/classify/draft flow while developing locally.
-
-### Required environment variables
+### Environment variables
 
 | Variable | Purpose |
 | --- | --- |
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | OAuth app used for every creator (see [Multi-tenancy and quota](#multi-tenancy-and-quota)) |
-| `SESSION_ENCRYPTION_KEY` | AES-256 key (base64) encrypting OAuth tokens at rest — generate with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"` |
-| `CRON_SECRET` | Shared secret Vercel Cron sends when triggering the background sync tick — generate the same way |
-| `DAILY_QUOTA_BUDGET` / `PER_CREATOR_DAILY_QUOTA` | YouTube API quota ledger caps — see below |
+| `AWS_REGION` | AWS region for Amazon Bedrock (default: `us-east-1`) |
+| `AWS_BEDROCK_MODEL_ID` | Model identifier (default: `anthropic.claude-3-5-sonnet-20241022-v2:0`) |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | AWS credentials with Bedrock model invocation permissions |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google Cloud OAuth web client credentials |
+| `DATABASE_URL` | Neon Postgres connection string |
+| `SESSION_ENCRYPTION_KEY` | AES-256 key (base64) encrypting OAuth tokens at rest |
+| `CRON_SECRET` | Shared secret for background sync ticks |
+| `DAILY_QUOTA_BUDGET` / `PER_CREATOR_DAILY_QUOTA` | YouTube API quota ledger caps (default: 8,000 / 1,500 units) |
+
+---
 
 ## Deploying
 
-One Vercel project serves both halves:
-
+One Vercel or AWS serverless project serves both halves:
 - The **frontend** is the Vite build (`npm run build` -> `dist/`).
-- The **API** is the Express app in `server/index.js`, wrapped as a single serverless function by `api/index.js`. An Express app is already a `(req, res)` handler, so exporting it is all Vercel needs.
-- `vercel.ts` rewrites `/api/(.*)` to that function and everything else to `index.html` (react-router owns `/videos`, `/sent`, `/reply-desk/:id`, none of which exist on disk). Rewrites run after the filesystem check, so real static assets still win.
-- `server/index.js` only calls `app.listen()` when `process.env.VERCEL` is unset, so `npm run server` still runs a normal long-lived process locally.
+- The **API** is the Express app in `server/index.js`, wrapped as a serverless function by `api/index.js`.
+- `vercel.ts` rewrites `/api/(.*)` to the API function and all client routes to `index.html`.
 
-Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, `DATABASE_URL`, `SESSION_ENCRYPTION_KEY`, `CRON_SECRET`, and `FRONTEND_URL` as project environment variables, and add the deployed `/api/oauth2callback` URL to the Google OAuth client's authorized redirect URIs.
-
-## AI features (reclassify & draft generation)
-
-Two reply-desk actions call an LLM through the **Vercel AI Gateway** (`server/ai.js`), both explicit and creator-triggered — never automatic, so cost stays as predictable as the YouTube quota ledger above:
-
-- **"Reclassify with AI"** (cluster rail) re-buckets a video's already-synced comments into the creator's real categories with `anthropic/claude-haiku-4.5`, instead of the plain keyword classifier (`server/classify.js`). Keyword matching stays the instant/free default during sync.
-- **"AI DRAFT"** (composer) generates a reply for the open answer pack with `anthropic/claude-sonnet-5`, grounded in a sample of its comments plus the pack's saved context note. The creator still reviews, edits, and explicitly selects before anything sends.
-
-Locally, auth is OIDC via `VERCEL_OIDC_TOKEN` (already in `.env.local` from `vercel env pull`) — no separate API key needed. That token expires after ~24h; if the two AI actions start failing with an auth error, re-run `vercel env pull .env.local --yes` and restart `npm run server`. The AI Gateway also needs a **credit card on file** on the Vercel team (even to spend the $5/month free credits) — add one at `vercel.com/[team]/~/ai` if requests come back with a billing error.
+---
 
 ## Security
 
