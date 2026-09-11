@@ -58,6 +58,8 @@ export async function fetchRecentCommentThreads(youtube, videoId, maxResults = 1
     })
     return response.data.items || []
   } catch (error) {
+    const isQuota = /quota/i.test(error.message || '') || error.errors?.some((e) => /quota/i.test(e.reason || ''))
+    if (isQuota) throw error
     if (error.code === 403 || error.code === 404) return [] // comments disabled or video not found
     throw error
   }

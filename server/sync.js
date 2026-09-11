@@ -137,107 +137,116 @@ async function persistVideoStubs(db, creatorId, videos) {
 export async function advanceSyncJob(db, job, youtube, classify, weights) {
   if (job.status !== 'running' && job.status !== 'paused_quota') return job
 
-  // A cursor written before videoIds existed carries the old
-  // { videos: [...full objects...] } shape. Redo phase 1 rather than trying
-  // to migrate it in place — phase 1 is cheap and idempotent.
-  if (!job.cursor?.videoIds) {
-    // Phase 1: list every video on the channel (paginated) + batch comment
-    // counts. Cost isn't known exactly until we see how many pages that
-    // takes, so gate on a conservative flat estimate up front and record
-    // the real cost afterward.
-    const budget = await checkBudget(db, job.creatorId, UNIT_COSTS.list * 5)
-    if (!budget.allowed) return updateJob(db, job.id, { status: 'paused_quota' })
+  try {
+    // A cursor written before videoIds existed carries the old
+    // { videos: [...full objects...] } shape. Redo phase 1 rather than trying
+    // to migrate it in place — phase 1 is cheap and idempotent.
+    if (!job.cursor?.videoIds) {
+      // Phase 1: list every video on the channel (paginated) + batch comment
+      // counts. Cost isn't known exactly until we see how many pages that
+      // takes, so gate on a conservative flat estimate up front and record
+      // the real cost afterward.
+      const budget = await checkBudget(db, job.creatorId, UNIT_COSTS.list * 5)
+      if (!budget.allowed) return updateJob(db, job.id, { status: 'paused_quota' })
 
-    const uploadsPlaylistId = await fetchUploadsPlaylistId(youtube, job.creatorId)
-    if (!uploadsPlaylistId) return updateJob(db, job.id, { status: 'error', error: "Could not find this channel's uploads playlist." })
+      const uploadsPlaylistId = await fetchUploadsPlaylistId(youtube, job.creatorId)
+      if (!uploadsPlaylistId) return updateJob(db, job.id, { status: 'error', error: "Could not find this channel's uploads playlist." })
 
-    const channelVideos = await fetchAllChannelVideos(youtube, uploadsPlaylistId)
-    const commentCounts = await fetchVideoCommentCounts(youtube, channelVideos.map((video) => video.id))
-    const pages = Math.max(1, Math.ceil(channelVideos.length / 50))
-    await recordUsage(db, job.creatorId, UNIT_COSTS.list * (1 + pages + pages)) // channels.list + playlistItems pages + videos.list batches
+      const channelVideos = await fetchAllChannelVideos(youtube, uploadsPlaylistId)
+      const commentCounts = await fetchVideoCommentCounts(youtube, channelVideos.map((video) => video.id))
+      const pages = Math.max(1, Math.ceil(channelVideos.length / 50))
+      await recordUsage(db, job.creatorId, UNIT_COSTS.list * (1 + pages + pages)) // channels.list + playlistItems pages + videos.list batches
 
-    const videos = channelVideos.map((video) => ({ ...video, commentCount: commentCounts.get(video.id) || 0 }))
-    // Persist the videos themselves now, and keep only their ids in the
-    // cursor. The cursor used to hold every video's full record and was
-    // rewritten on every 10-video chunk — a multi-hundred-KB JSONB blob sent
-    // over the wire hundreds of times for a large channel. It also meant the
-    // creator saw an empty workspace until the entire sync finished; now the
-    // list appears as soon as phase 1 lands and fills in with rankings.
-    await persistVideoStubs(db, job.creatorId, videos)
-    return updateJob(db, job.id, {
-      cursor: { videoIds: videos.map((video) => video.id), index: 0 },
-      videosTotal: videos.length,
-      status: 'running',
-    })
-  }
-
-  // Phase 2: process the next chunk of videos.
-  const { videoIds, index } = job.cursor
-  if (index >= videoIds.length) return updateJob(db, job.id, { status: 'done' })
-
-  const chunkIds = videoIds.slice(index, index + CHUNK_SIZE)
-  // Read the chunk's details back from the videos table rather than carrying
-  // them in the cursor. One indexed lookup per chunk, versus re-sending the
-  // whole channel every time.
-  const chunk = await db.select().from(schema.videos)
-    .where(and(eq(schema.videos.creatorId, job.creatorId), inArray(schema.videos.id, chunkIds)))
-
-  const chunkCost = chunk.filter((video) => video.commentCount > 0).length * UNIT_COSTS.list
-  const budget = await checkBudget(db, job.creatorId, chunkCost)
-  if (!budget.allowed) return updateJob(db, job.id, { status: 'paused_quota' })
-
-  const videoRows = []
-  const commentRows = []
-  const answerPackRows = []
-
-  for (const video of chunk) {
-    const threads = video.commentCount > 0 ? await fetchRecentCommentThreads(youtube, video.id) : []
-    const comments = normalizeThreads(threads).map((comment) => ({ ...comment, packId: classify(comment.text) }))
-    const bucketCounts = {}
-    for (const comment of comments) bucketCounts[comment.packId] = (bucketCounts[comment.packId] || 0) + 1
-    const [topPackId, topCount] = Object.entries(bucketCounts).sort((a, b) => b[1] - a[1])[0] || [null, 0]
-    const publishedAt = video.publishedAt ? new Date(video.publishedAt) : null
-
-    videoRows.push({
-      id: video.id,
-      creatorId: job.creatorId,
-      title: video.title,
-      thumbnailUrl: video.thumbnailUrl,
-      publishedAt,
-      lastSyncedAt: new Date(),
-      priorityScore: computePriorityScore(bucketCounts, publishedAt, Date.now(), weights),
-      commentCount: video.commentCount,
-      topPackId: topCount > 0 ? topPackId : null,
-    })
-
-    for (const comment of comments) {
-      commentRows.push({
-        id: comment.id,
-        videoId: video.id,
-        parentId: comment.parentId,
-        authorName: comment.name,
-        authorInitials: comment.initials,
-        text: comment.text,
-        likeCount: comment.likes,
-        publishedAt: comment.publishedAt ? new Date(comment.publishedAt) : null,
-        packId: comment.packId,
+      const videos = channelVideos.map((video) => ({ ...video, commentCount: commentCounts.get(video.id) || 0 }))
+      // Persist the videos themselves now, and keep only their ids in the
+      // cursor. The cursor used to hold every video's full record and was
+      // rewritten on every 10-video chunk — a multi-hundred-KB JSONB blob sent
+      // over the wire hundreds of times for a large channel. It also meant the
+      // creator saw an empty workspace until the entire sync finished; now the
+      // list appears as soon as phase 1 lands and fills in with rankings.
+      await persistVideoStubs(db, job.creatorId, videos)
+      return updateJob(db, job.id, {
+        cursor: { videoIds: videos.map((video) => video.id), index: 0 },
+        videosTotal: videos.length,
+        status: 'running',
       })
     }
-    for (const packId of new Set(comments.map((comment) => comment.packId))) {
-      answerPackRows.push({ videoId: video.id, packId, draft: '' })
+
+    // Phase 2: process the next chunk of videos.
+    const { videoIds, index } = job.cursor
+    if (index >= videoIds.length) return updateJob(db, job.id, { status: 'done' })
+
+    const chunkIds = videoIds.slice(index, index + CHUNK_SIZE)
+    // Read the chunk's details back from the videos table rather than carrying
+    // them in the cursor. One indexed lookup per chunk, versus re-sending the
+    // whole channel every time.
+    const chunk = await db.select().from(schema.videos)
+      .where(and(eq(schema.videos.creatorId, job.creatorId), inArray(schema.videos.id, chunkIds)))
+
+    const chunkCost = chunk.filter((video) => video.commentCount > 0).length * UNIT_COSTS.list
+    const budget = await checkBudget(db, job.creatorId, chunkCost)
+    if (!budget.allowed) return updateJob(db, job.id, { status: 'paused_quota' })
+
+    const videoRows = []
+    const commentRows = []
+    const answerPackRows = []
+
+    for (const video of chunk) {
+      const threads = video.commentCount > 0 ? await fetchRecentCommentThreads(youtube, video.id) : []
+      const comments = normalizeThreads(threads).map((comment) => ({ ...comment, packId: classify(comment.text) }))
+      const bucketCounts = {}
+      for (const comment of comments) bucketCounts[comment.packId] = (bucketCounts[comment.packId] || 0) + 1
+      const [topPackId, topCount] = Object.entries(bucketCounts).sort((a, b) => b[1] - a[1])[0] || [null, 0]
+      const publishedAt = video.publishedAt ? new Date(video.publishedAt) : null
+
+      videoRows.push({
+        id: video.id,
+        creatorId: job.creatorId,
+        title: video.title,
+        thumbnailUrl: video.thumbnailUrl,
+        publishedAt,
+        lastSyncedAt: new Date(),
+        priorityScore: computePriorityScore(bucketCounts, publishedAt, Date.now(), weights),
+        commentCount: video.commentCount,
+        topPackId: topCount > 0 ? topPackId : null,
+      })
+
+      for (const comment of comments) {
+        commentRows.push({
+          id: comment.id,
+          videoId: video.id,
+          parentId: comment.parentId,
+          authorName: comment.name,
+          authorInitials: comment.initials,
+          text: comment.text,
+          likeCount: comment.likes,
+          publishedAt: comment.publishedAt ? new Date(comment.publishedAt) : null,
+          packId: comment.packId,
+        })
+      }
+      for (const packId of new Set(comments.map((comment) => comment.packId))) {
+        answerPackRows.push({ videoId: video.id, packId, draft: '' })
+      }
     }
+
+    await persistRows(db, videoRows, commentRows, answerPackRows)
+    if (chunkCost) await recordUsage(db, job.creatorId, chunkCost)
+
+    const newIndex = index + chunkIds.length
+    return updateJob(db, job.id, {
+      // Patch just the index in place — no need to round-trip the id list.
+      cursor: sql`jsonb_set(${schema.syncJobs.cursor}, '{index}', ${String(newIndex)}::jsonb)`,
+      videosProcessed: newIndex,
+      status: newIndex >= videoIds.length ? 'done' : 'running',
+    })
+  } catch (error) {
+    const isQuota = (error.code === 403 || error.status === 403) && /quota/i.test(error.message || '')
+    const status = isQuota ? 'paused_quota' : 'error'
+    return updateJob(db, job.id, {
+      status,
+      error: error.message || 'Sync failed unexpectedly.',
+    })
   }
-
-  await persistRows(db, videoRows, commentRows, answerPackRows)
-  if (chunkCost) await recordUsage(db, job.creatorId, chunkCost)
-
-  const newIndex = index + chunkIds.length
-  return updateJob(db, job.id, {
-    // Patch just the index in place — no need to round-trip the id list.
-    cursor: sql`jsonb_set(${schema.syncJobs.cursor}, '{index}', ${String(newIndex)}::jsonb)`,
-    videosProcessed: newIndex,
-    status: newIndex >= videoIds.length ? 'done' : 'running',
-  })
 }
 
 // Drives a job forward for up to `timeBudgetMs` (default 20s, well under a

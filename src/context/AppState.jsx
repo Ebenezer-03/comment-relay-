@@ -42,6 +42,13 @@ export function AppStateProvider({ children }) {
   const [draftGenerating, setDraftGenerating] = useState(false)
   const [aiError, setAiError] = useState('')
 
+  // Clear selections whenever the active cluster changes to avoid phantom selections
+  useEffect(() => {
+    setSelected([])
+    setSent(false)
+    setSendError('')
+  }, [activeId])
+
   useEffect(() => {
     const session = new URLSearchParams(window.location.search).get('session')
     if (session) {

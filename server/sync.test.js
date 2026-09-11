@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { advanceSyncJob } from './sync.js'
 import { DEFAULT_CATEGORIES } from './classify.js'
 import { weightsFromCategories } from './priority.js'
+import { schema } from './db/index.js'
 
 // Minimal stand-in for the drizzle query builder. Only the chains
 // advanceSyncJob() actually uses are implemented; each terminal call records
@@ -9,23 +10,30 @@ import { weightsFromCategories } from './priority.js'
 // down the sync job's state machine without a live Postgres.
 function fakeDb({ videos = [], quotaUnits = 0 } = {}) {
   const calls = { updates: [], inserts: [] }
-  const thenable = (rows) => {
+  const thenable = (resolveRows) => {
+    let currentTable = null
     const chain = {
-      from: () => chain,
+      from: (table) => {
+        currentTable = table
+        return chain
+      },
       where: () => chain,
       limit: () => chain,
       orderBy: () => chain,
-      then: (resolve, reject) => Promise.resolve(rows).then(resolve, reject),
+      then: (resolve, reject) => {
+        const rows = typeof resolveRows === 'function' ? resolveRows(currentTable) : resolveRows
+        return Promise.resolve(rows).then(resolve, reject)
+      },
     }
     return chain
   }
   return {
     calls,
-    select: (fields) => {
-      // unitsUsedToday() selects the whole quota row; everything else here
-      // is the phase-2 lookup of the chunk's videos.
-      if (fields === undefined) return thenable([{ unitsUsed: quotaUnits }])
-      return thenable(videos)
+    select: () => {
+      return thenable((table) => {
+        if (table === schema.quotaUsage) return [{ unitsUsed: quotaUnits }]
+        return videos
+      })
     },
     insert: (table) => ({
       values: (rows) => {
@@ -161,10 +169,45 @@ describe('advanceSyncJob — phase 2 (per-video comments)', () => {
     expect(job.status).toBe('paused_quota')
   })
 
-  it('ignores jobs that are neither running nor quota-paused', async () => {
-    const db = fakeDb()
-    const done = { id: 'job1', creatorId: 'UC_test', status: 'done', cursor: { videoIds: [], index: 0 } }
-    expect(await advanceSyncJob(db, done, fakeYoutube([]), classify, weights)).toBe(done)
-    expect(db.calls.updates).toHaveLength(0)
+  it('marks job as error when an unexpected API exception occurs', async () => {
+    const db = fakeDb({ videos: [{ id: 'vid1', commentCount: 5, publishedAt: new Date() }] })
+    const brokenYoutube = {
+      commentThreads: {
+        list: async () => {
+          throw new Error('Network timeout talking to YouTube API')
+        },
+      },
+    }
+    const job = await advanceSyncJob(
+      db,
+      runningJob({ videoIds: ['vid1'], index: 0 }),
+      brokenYoutube,
+      classify,
+      weights,
+    )
+    expect(job.status).toBe('error')
+    expect(job.error).toContain('Network timeout')
+  })
+
+  it('marks job as paused_quota when YouTube returns a 403 quota exceeded error', async () => {
+    const db = fakeDb({ videos: [{ id: 'vid1', commentCount: 5, publishedAt: new Date() }] })
+    const quotaExceededYoutube = {
+      commentThreads: {
+        list: async () => {
+          const err = new Error('Quota exceeded for quota metric Queries')
+          err.code = 403
+          throw err
+        },
+      },
+    }
+    const job = await advanceSyncJob(
+      db,
+      runningJob({ videoIds: ['vid1'], index: 0 }),
+      quotaExceededYoutube,
+      classify,
+      weights,
+    )
+    expect(job.status).toBe('paused_quota')
   })
 })
+

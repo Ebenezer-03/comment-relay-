@@ -646,6 +646,16 @@ app.delete('/api/categories/:packId', requireSession('Connect a Google account b
       ),
     ))
 
+  // Clean up any orphaned answer pack drafts for the deleted category
+  await db.delete(schema.answerPacks)
+    .where(and(
+      eq(schema.answerPacks.packId, target.packId),
+      inArray(
+        schema.answerPacks.videoId,
+        db.select({ id: schema.videos.id }).from(schema.videos).where(eq(schema.videos.creatorId, session.creatorId)),
+      ),
+    ))
+
   await db.delete(schema.categories).where(and(eq(schema.categories.creatorId, session.creatorId), eq(schema.categories.packId, req.params.packId)))
   res.json({ categories: await getCategories(db, session.creatorId) })
 })
